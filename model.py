@@ -113,6 +113,7 @@ class DiffPruning:
         self.all_alpha = None
         self.all_diff = None
         self.optimiser_grouped_parameters = []
+        self.bert_params = {}
         self._get_params()
 
         self.optimiser_params = AdamW(self.optimiser_grouped_parameters, lr=lr_params, eps=eps)
@@ -162,6 +163,8 @@ class DiffPruning:
                 no_decay['params'].append(diff)
             else:
                 decay['params'].append(diff)
+
+            self.bert_params[name] = [pretrained, diff, alpha]
             self.pretrained.append(pretrained)
             self.diff.append(diff)
             ### PER LAYER ALPHA ###
@@ -185,10 +188,29 @@ class DiffPruning:
 
             epoch_iterator = tqdm(train_dataloader, desc="Iteration")
             for step, batch in enumerate(epoch_iterator):
-                nonzero_params = 0
+
                 l0_penalty += torch.sigmoid(self.all_alpha - self.log_ratio).sum()
                 # TODO: PER PARAMS ALPHA
 
+                # initialising diff vector decomposition
+                z, z_grad = self.concrete_stretched(self.all_alpha)
+                cnt = 0
+                nonzero_params = 0
+                for name, param in self.model.named_parameters():
+                    if "classifier" in name:
+                        nonzero_params += param.numel()
+                        # classifier diff vec is added to pretrained w/o z
+                        param.data.copy_(self.bert_params[name][0].data + self.bert_params[name][1].data)
+                    else:
+                        next_cnt = cnt + param.numel()
+
+                        z_ = z[cnt:next_cnt].reshape_as(param)
+                        param.data.copy_(self.bert_params[name][0].data +
+                                         z_ * self.bert_params[name][1].data)
+                        nonzero_params += (z_ > 0).float().detach().sum().item()
+                        cnt = next_cnt
+
+                # forward pass
                 input_ids, attention_mask, token_type_ids, labels = batch
                 output = self.model(input_ids, attention_mask, token_type_ids, labels)
                 loss = output.loss
@@ -200,8 +222,4 @@ class DiffPruning:
 
                 if (step + 1) % self.gradient_accumulation_steps == 0:
                     pass
-
-                # z, z_grad = self.concrete_stretched()
-                # z, z_grad = one_pass_concrete_stretched(all_alpha, args.concrete_lower,
-                #                                         args.concrete_upper)
-                # z2_, z2_grad_ = one_pass_concrete_stretched(all_pp_alpha, args.concrete_lower, args.concrete_upper)
+                
