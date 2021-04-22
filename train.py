@@ -1,6 +1,5 @@
 from model import DiffPruning
 from transformers import (
-    BertConfig,
     BertForSequenceClassification,
     BertTokenizer,
 )
@@ -8,7 +7,7 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 import logging
 
-logging.basicConfig(filename="log.txt", filemode='a', level=10)
+logging.basicConfig(filename="log.txt", filemode='a', level=20)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -35,7 +34,8 @@ def prepare_dataloader(data, labels, tokenizer):
 def main():
     bert = BertForSequenceClassification.from_pretrained("bert-base-uncased")
     model = DiffPruning(bert, "bert", concrete_lower=-0.01, concrete_upper=1.1, total_layers=14, weight_decay=0.0001,
-                        warmup_steps=100, gradient_accumulation_steps=2, max_grad_norm=1, device=DEVICE)
+                        warmup_steps=100, gradient_accumulation_steps=1, max_grad_norm=1,
+                        device=DEVICE)
 
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
@@ -50,7 +50,7 @@ def main():
     train_dataloader = prepare_dataloader(train_data, train_labels, tokenizer)
     val_dataloader = prepare_dataloader(val_data, val_labels, tokenizer)
 
-    model.train(train_dataloader, val_dataloader, 2)
+    model.train(train_dataloader, val_dataloader, 1)
 
 
 if __name__ == "__main__":
