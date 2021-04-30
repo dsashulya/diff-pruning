@@ -1,4 +1,3 @@
-import pandas as pd
 from model import DiffPruning
 from transformers import BertForSequenceClassification, BertTokenizer
 import torch
