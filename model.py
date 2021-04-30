@@ -3,11 +3,9 @@ import logging
 from typing import Tuple, List, Union, NoReturn
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm, trange
-from log import setup_logging
-import apex
 
 NO_DECAY = ["bias", "LayerNorm.weight"]
 
@@ -24,7 +22,6 @@ class ConcreteStretched:
         self.device = device
         self.l = l
         self.r = r
-        self.logger = logging.getLogger(__name__)
 
     def __call__(self, alpha: torch.Tensor, return_grad: bool = True) \
             -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
@@ -41,26 +38,20 @@ class ConcreteStretched:
                 gradient of the output with respect to input
        """
         u = torch.rand_like(alpha).clamp(1e-8, 1)
-        s = (torch.sigmoid(u.log() - (1 - u).log() + alpha)).detach()
+        s = (torch.sigmoid(u.log() - (1 - u).log() + alpha))
         s_ = s * (self.r - self.l) + self.l
         t = torch.max(torch.zeros_like(s_), s_)
         z = torch.min(torch.ones_like(s_), t)
+
         if return_grad:
             # dz/da = dz/dt * dt/ds_ * ds_/ds * ds/da
-            dz_dt = (t < 1).float().detach()
-            dt_ds_ = (s_ > 0).float().detach()
+            dz_dt = (t < 1).float()
+            dt_ds_ = (s_ > 0).float()
             ds__ds = self.r - self.l
-            ds_dalpha = (s * (1 - s)).detach()
+            ds_dalpha = s * (1 - s)
             dz_dalpha = dz_dt * dt_ds_ * ds__ds * ds_dalpha
-            # self.__log_grad(dz_dalpha)
-            return z.detach(), dz_dalpha.detach()
-        return z.detach()
-
-    def __log_grad(self, dz_dalpha):
-        self.logger.info(
-            f"dz/dalpha:\n{dz_dalpha}"
-            f"\n{torch.all(dz_dalpha == torch.zeros_like(dz_dalpha))}"
-        )
+            return z, dz_dalpha
+        return z
 
 
 class DiffPruning:
@@ -70,7 +61,7 @@ class DiffPruning:
                  sparsity_penalty: float, max_grad_norm: float,
                  lr_params: float = 2e-5, lr_alpha: float = 2e-5, eps: float = 1e-8,
                  alpha_init: float = 0., per_params_alpha: bool = False, per_layer_alpha: bool = False,
-                 device: str = "cuda", local_rank: int = -1, opt_level: str = None):
+                 device: str = "cuda"):
         """
         Parameters:
             model: nn.Module
@@ -109,16 +100,17 @@ class DiffPruning:
                 device used for training (cpu / cuda)
         """
         self.model = model.to(device)
+        assert not (per_params_alpha and per_layer_alpha), \
+            "Structured diff pruning can only be used either per params or per layer"
         self.pp_alpha = per_params_alpha
         self.pl_alpha = per_layer_alpha
         self.device = device
-        self.local_rank = local_rank
         self.model_name = model_name.lower()
         self.total_layers = total_layers
         self.max_grad_norm = max_grad_norm
         self.alpha_init = alpha_init
         self.log_ratio = self._get_log_ratio(concrete_lower, concrete_upper)
-        self.concrete_stretched = ConcreteStretched(concrete_lower, concrete_upper, device)
+        self.concrete_stretched = ConcreteStretched(concrete_lower, concrete_upper)
 
         self.weight_decay = weight_decay
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -129,10 +121,6 @@ class DiffPruning:
         self.optimiser_grouped_parameters = []
         self.per_params_alpha = None
         self.per_layer_alpha = None
-        self.grad_params = {}
-        self.per_params_z_grad = {}
-        self.per_layer_z_grad = []
-        # initialising parameters
         self.__get_params()
 
         self.optimizer_params = AdamW(self.optimiser_grouped_parameters, lr=lr_params, eps=eps)
@@ -142,11 +130,11 @@ class DiffPruning:
         self.scheduler_params = None
         self.scheduler_alpha = None
 
-        # distributed training
-        self.__setup_distributed_training(self.model, self.optimizer_params, opt_level)
-
-        # logging
+        # for training
         self.logger = logging.getLogger(__name__)
+        self.grad_params = None
+        self.per_params_z_grad = None
+        self.per_layer_z_grad = None
 
     def _get_layer_ind(self, layer_name: str) -> int:
         """
@@ -197,11 +185,8 @@ class DiffPruning:
             loss /= self.gradient_accumulation_steps
             l0_penalty /= self.gradient_accumulation_steps
 
-        if self.local_rank != -1:
-            with apex.amp.scale_loss(loss, self.optimizer_params) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            loss.backward()
+        loss.backward()
+        l0_penalty *= self.sparsity_penalty
         l0_penalty.backward()
 
     def __calculate_params(self) -> Tuple[torch.Tensor, int]:
@@ -213,8 +198,15 @@ class DiffPruning:
             nonzero_params: int
                 total number of nonzero parameters in diff vector
          """
+        # l0_penalty_sum = torch.tensor([0.], requires_grad=True).to(self.device)
         nonzero_params = 0
-        l0_penalty_sum = None
+        l0_created = False
+        self.grad_params = {}
+        if self.pp_alpha:
+            self.per_params_z_grad = {}
+        elif self.pl_alpha:
+            self.per_layer_z_grad = {}
+
         prev_layer_ind = -1
         # iterate over params, calculate all model params (params + z * z2 * w) and l0 penalty
         for name, param in self.model.named_parameters():
@@ -226,30 +218,31 @@ class DiffPruning:
                 layer_ind = self._get_layer_ind(name)
                 # passing main alpha through concrete stretched
                 z, z_grad = self.concrete_stretched(self.bert_params[name][2])
-                if l0_penalty_sum is None:
+                if not l0_created:
                     l0_penalty_sum = torch.sigmoid(self.bert_params[name][2] - self.log_ratio).sum()
+                    l0_created = True
                 else:
                     l0_penalty_sum += torch.sigmoid(self.bert_params[name][2] - self.log_ratio).sum()
 
                 # PER PARAMS ALPHA
                 if self.pp_alpha:
                     z2, z2_grad = self.concrete_stretched(self.per_params_alpha[name])
-                    self.per_params_z_grad[name] += z2_grad
+                    self.per_params_z_grad[name] = z2_grad
                     l0_penalty_sum += torch.sigmoid(self.per_params_alpha[name] - self.log_ratio).sum()
 
                 # PER LAYER ALPHA
                 elif self.pl_alpha and layer_ind != prev_layer_ind:  # if layer number changed
                     z2, z2_grad = self.concrete_stretched(self.per_layer_alpha[layer_ind])
-                    self.per_layer_z_grad[layer_ind] += z2_grad
+                    self.per_layer_z_grad[layer_ind] = z2_grad
                     l0_penalty_sum += torch.sigmoid(self.per_layer_alpha[layer_ind] - self.log_ratio).sum()
 
                 else:  # only base alpha
                     z2 = torch.ones_like(z.data)
 
-                self.grad_params[name][0] += self.bert_params[name][1] * z2
-                self.grad_params[name][1] += z * z2
-                self.grad_params[name][2] += z_grad
-                self.grad_params[name][3] += self.bert_params[name][1] * z
+                self.grad_params[name] = [self.bert_params[name][1] * z2,
+                                          z * z2,
+                                          z_grad,
+                                          self.bert_params[name][1] * z]
 
                 param.data.copy_(self.bert_params[name][0].data +
                                  (z * z2).data * self.bert_params[name][1].data)
@@ -259,32 +252,32 @@ class DiffPruning:
 
     def __calculate_grads(self) -> NoReturn:
         for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
             if "classifier" in name:
                 # copying updated gradient to the respective w vector
-                self.bert_params[name][1].grad += param.grad.data
+                self.bert_params[name][1].grad.copy_(param.grad.data)
             else:
                 # adding grad to w
-                self.bert_params[name][1].grad += param.grad.data * self.grad_params[name][1].data
+                self.bert_params[name][1].grad.copy_(param.grad.data *
+                                                     self.grad_params[name][1].data)
                 # adding grad to base alpha
-                self.bert_params[name][2].grad += param.grad.data * \
-                                                  self.grad_params[name][0].data * \
-                                                  self.grad_params[name][2].data
+                self.bert_params[name][2].grad.copy_(param.grad.data *
+                                                     self.grad_params[name][0].data *
+                                                     self.grad_params[name][2].data)
                 # adding grad to per param / per layer alpha
                 if self.pp_alpha:
-                    self.per_params_alpha[name].grad += torch.sum(param.grad.data *
-                                                                  self.grad_params[name][3].data *
-                                                                  self.per_params_z_grad[name].data)
+                    self.per_params_alpha[name].grad.copy_(torch.sum(param.grad.data *
+                                                                     self.grad_params[name][3].data *
+                                                                     self.per_params_z_grad[name].data))
                 elif self.pl_alpha:
                     layer_ind = self._get_layer_ind(name)
-                    self.per_layer_alpha[layer_ind].grad += torch.sum(param.grad.data *
-                                                                      self.grad_params[name][3].data *
-                                                                      self.per_layer_z_grad[layer_ind].data)
+                    self.per_layer_alpha[layer_ind] += torch.sum(param.grad.data *
+                                                                 self.grad_params[name][3].data *
+                                                                 self.per_layer_z_grad[layer_ind].data)
 
     def __clip_grad_norms(self) -> NoReturn:
-        if self.local_rank != -1:
-            torch.nn.utils.clip_grad_norm_(apex.amp.master_params(self.optimizer_params), self.max_grad_norm)
-        else:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         torch.nn.utils.clip_grad_norm_(self.diff, self.max_grad_norm)
         torch.nn.utils.clip_grad_norm_(self.alpha, self.max_grad_norm)
 
@@ -292,8 +285,6 @@ class DiffPruning:
         """
         Extracts model parameters and initialises w and alpha
         """
-        assert not (self.pp_alpha and self.pl_alpha), \
-            "Structured diff pruning can only be used either per params or per layer"
         decay = {'params': [], 'weight_decay': self.weight_decay}
         no_decay = {'params': [], 'weight_decay': 0.}
         if self.pp_alpha:
@@ -301,9 +292,8 @@ class DiffPruning:
 
         for name, param in self.model.named_parameters():
             pretrained = torch.zeros_like(param.data, requires_grad=False).copy_(param).to(self.device)
-            diff = torch.zeros_like(param.data).to(self.device)
+            diff = torch.zeros_like(param.data, requires_grad=True).to(self.device)
             alpha = torch.zeros_like(param.data).to(self.device) + self.alpha_init
-            # diff.requires_grad = True
             alpha.requires_grad = True
 
             diff.grad = torch.zeros_like(diff)
@@ -328,26 +318,21 @@ class DiffPruning:
 
         # PER LAYER ALPHA
         if self.pl_alpha:
-            self.per_layer_alpha = []
-            for i in range(self.total_layers):
-                self.per_layer_alpha.append(torch.zeros(1).to(self.device) + self.alpha_init)
-                self.per_layer_alpha[i].requires_grad = True
-                self.per_layer_alpha[i].grad = torch.zeros_like(self.per_layer_alpha[i])
-            self.alpha.extend(self.per_layer_alpha)
+            self.per_layer_alpha = torch.zeros(self.total_layers).to(self.device) + self.alpha_init
+            self.per_layer_alpha.requires_grad = True
+            self.per_layer_alpha.grad = torch.zeros_like(self.per_layer_alpha)
 
         self.optimiser_grouped_parameters.extend([decay, no_decay])
-        self.__zero_grad()
         assert len(self.bert_params) and len(self.diff) and len(self.alpha), "Parameters were not initialised"
-        assert len(self.grad_params), "Gradients were not initialised"
 
     def __log_epoch(self, epoch: int, update_steps: int, train_losses: list,
-                    val_losses: list, nonzero_params: list, l0_penalties: list, norm: bool = False) -> NoReturn:
-        string = f"Epoch {epoch + 1} | Update step {update_steps} average values:" + \
-                 f"\n\ttrain loss = {np.array(train_losses).mean():.3f} "
-        if len(val_losses):
-            string += f"val loss = {np.array(val_losses).mean():.3f}"
-        string += f"\n\tnonzero params = {np.array(nonzero_params).mean():,.0f}" + \
-                 f"\n\tL0 penalty = {np.array(l0_penalties).mean():,.3f}"
+                    val_losses: list, nonzero_params: list,
+                    l0_penalties: list, norm: bool = False) -> NoReturn:
+        string = f"Epoch {epoch + 1} | Update step {update_steps} average values:" +\
+            f"\n\ttrain loss = {np.array(train_losses).mean():.3f} " +\
+            f"val loss = {np.array(val_losses).mean():.3f}" +\
+            f"\n\tnonzero params = {np.array(nonzero_params).mean():,.0f}" +\
+            f"\n\tL0 penalty = {np.array(l0_penalties).mean():,.3f}"
         if norm:
             norms = self._calculate_param_norms()
             string += f"\n\tnorms = {np.array(norms).mean(axis=0)}"
@@ -375,27 +360,7 @@ class DiffPruning:
         self.scheduler_alpha.step()
 
         self.model.zero_grad()
-        self.optimizer_params.zero_grad()
-        self.optimizer_alpha.zero_grad()
-        self.__zero_grad()
 
-    def __setup_distributed_training(self, model, optimizer, opt_level) -> NoReturn:
-        if self.local_rank != -1:
-            model, optimizer = apex.amp.initialize(model, optimizer, opt_level=opt_level, verbosity=0)
-            model = apex.parallel.distributed.DistributedDataParallel(model)
-        self.model = model
-        self.optimizer_params = optimizer
-
-    def __zero_grad(self) -> NoReturn:
-        for name, param in self.model.named_parameters():
-            if "classifier" not in name:
-                self.grad_params[name] = [torch.zeros_like(self.bert_params[name][1]) for _ in range(4)]
-                if self.pp_alpha:
-                    self.per_params_z_grad[name] = torch.zeros_like(self.per_params_alpha[name])
-        if self.pl_alpha:
-            self.per_layer_z_grad = [0] * self.total_layers
-
-    @torch.no_grad()
     def evaluate(self, dataloader: DataLoader) -> float:
         """
         Parameters:
@@ -407,26 +372,27 @@ class DiffPruning:
         """
         total_loss = 0.
         self.model.eval()
-        epoch_iterator = tqdm(dataloader, desc="Val iteration", position=0, leave=True)
-        for _, batch in enumerate(epoch_iterator):
-            for name, param in self.model.named_parameters():
-                if "classifier" in name:
-                    param.data.copy_(self.bert_params[name][0].data + self.bert_params[name][1].data)
-                else:
-                    layer_ind = self._get_layer_ind(name)
-                    z = self.concrete_stretched(self.bert_params[name][2], return_grad=False)
-                    if self.pp_alpha:  # per params alpha
-                        z2 = self.concrete_stretched(self.per_params_alpha[name], return_grad=False)
-                    elif self.pl_alpha:  # per layer alpha
-                        z2 = self.concrete_stretched(self.per_layer_alpha[layer_ind], return_grad=False)
-                    else:  # only base alpha
-                        z2 = torch.ones_like(z.data)
+        with torch.no_grad():
+            epoch_iterator = tqdm(dataloader, desc="Val iteration", position=0, leave=True)
+            for _, batch in enumerate(epoch_iterator):
+                for name, param in self.model.named_parameters():
+                    if "classifier" in name:
+                        param.data.copy_(self.bert_params[name][0].data + self.bert_params[name][1].data)
+                    else:
+                        layer_ind = self._get_layer_ind(name)
+                        z = self.concrete_stretched(self.bert_params[name][2], return_grad=False)
+                        if self.pp_alpha:  # per params alpha
+                            z2 = self.concrete_stretched(self.per_params_alpha[name], return_grad=False)
+                        elif self.pl_alpha:  # per layer alpha
+                            z2 = self.concrete_stretched(self.per_layer_alpha[layer_ind], return_grad=False)
+                        else:  # only base alpha
+                            z2 = torch.ones_like(z.data)
 
-                    param.data.copy_(self.bert_params[name][0].data +
-                                     (z * z2).data * self.bert_params[name][1].data)
+                        param.data.copy_(self.bert_params[name][0].data +
+                                         (z * z2).data * self.bert_params[name][1].data)
 
-            output = self.forward(batch)
-            total_loss += output.loss.item()
+                output = self.forward(batch)
+                total_loss += output.loss.item()
         return total_loss / len(dataloader)
 
     def forward(self, batch: list):
@@ -446,8 +412,7 @@ class DiffPruning:
                             labels=labels)
         return output
 
-    def train(self, train_dataloader: DataLoader, val_dataloader: DataLoader = None, epochs: int = 5,
-              write: bool = True) -> NoReturn:
+    def train(self, train_dataloader: DataLoader, val_dataloader: DataLoader, epochs: int) -> NoReturn:
         """
         Parameters:
             train_dataloader: torch.utils.data.Dataloader
@@ -456,14 +421,7 @@ class DiffPruning:
                 data used for evaluation
             epochs: int
                 number of training epochs
-            write: bool
-                write to tensorboard
         """
-        # preparing summary writer
-        writer = None
-        if write:
-            writer = setup_logging(self.model_name)
-
         self.__prepare_scheduler(train_dataloader, epochs)
         self.model.zero_grad()
         train_losses = []
@@ -474,21 +432,16 @@ class DiffPruning:
 
         train_iterator = trange(0, epochs, desc="Epoch")
         for epoch in train_iterator:
-            if isinstance(train_dataloader.sampler, DistributedSampler):
-                train_dataloader.sampler.set_epoch(epoch)
             epoch_iterator = tqdm(train_dataloader, desc="Train iteration", position=0, leave=True)
             for step, batch in enumerate(epoch_iterator):
                 l0_penalty_sum, nonzero_params = self.__calculate_params()
-                l0_penalty_sum *= self.sparsity_penalty
 
                 # forward pass
                 self.model.train()
                 output = self.forward(batch)
                 loss = output.loss
-                if self.local_rank != -1:
-                    loss = loss.mean()
                 train_losses.append(loss.item())
-                l0_penalties.append(l0_penalty_sum.item())
+                l0_penalties.append(self.sparsity_penalty * l0_penalty_sum.item())
 
                 self.__backward(loss, l0_penalty_sum)
 
@@ -503,29 +456,8 @@ class DiffPruning:
                     update_steps += 1
                     nonzero.append(nonzero_params)
 
-                    if val_dataloader is not None:
-                        avg_val_loss = self.evaluate(val_dataloader)
-                        val_losses.append(avg_val_loss)
-
-                    # tensorboard
-                    if writer is not None:
-                        writer.add_scalar('training loss',
-                                          sum(train_losses[
-                                              -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
-                                          update_steps)
-                        if val_dataloader is not None:
-                            writer.add_scalar('validation loss',
-                                              sum(val_losses[
-                                                  -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
-                                              update_steps)
-                        writer.add_scalar('L0 penalty',
-                                          sum(l0_penalties[
-                                              -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
-                                          update_steps)
-                        writer.add_scalar('Nonzero params count',
-                                          sum(nonzero[
-                                              -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
-                                          update_steps)
+                    avg_val_loss = self.evaluate(val_dataloader)
+                    val_losses.append(avg_val_loss)
 
             # logging epoch
             self.__log_epoch(epoch, update_steps, train_losses,
@@ -534,4 +466,3 @@ class DiffPruning:
             train_losses = []
             l0_penalties = []
             val_losses = []
-

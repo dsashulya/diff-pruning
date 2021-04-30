@@ -1,4 +1,3 @@
 .DS_Store
-log.txt
-Pipfile
+../log_old.txt
 __pycache__
