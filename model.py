@@ -185,7 +185,7 @@ class DiffPruning:
     def _calculate_param_norms(self, order: int = 2) -> List[List[float]]:
         norms = []
         for name, _ in self.model.named_parameters():
-            bert, diff, alpha = self.bert_params[name]
+            bert, diff, alpha = self.bert_params[name].values()
             norms.append([torch.linalg.norm(bert, ord=order).item(),
                           torch.linalg.norm(diff, ord=order).item(),
                           torch.linalg.norm(alpha, ord=order).item()
@@ -221,15 +221,15 @@ class DiffPruning:
             if "classifier" in name:
                 nonzero_params += param.numel()
                 # classifier diff vec is added to pretrained w/o z (base params + w)
-                param.data.copy_(self.bert_params[name][0].data + self.bert_params[name][1].data)
+                param.data.copy_(self.bert_params[name]['pretrained'].data + self.bert_params[name]['w'].data)
             else:
                 layer_ind = self._get_layer_ind(name)
                 # passing main alpha through concrete stretched
-                z, z_grad = self.concrete_stretched(self.bert_params[name][2])
+                z, z_grad = self.concrete_stretched(self.bert_params[name]['alpha'])
                 if l0_penalty_sum is None:
-                    l0_penalty_sum = torch.sigmoid(self.bert_params[name][2] - self.log_ratio).sum()
+                    l0_penalty_sum = torch.sigmoid(self.bert_params[name]['alpha'] - self.log_ratio).sum()
                 else:
-                    l0_penalty_sum += torch.sigmoid(self.bert_params[name][2] - self.log_ratio).sum()
+                    l0_penalty_sum += torch.sigmoid(self.bert_params[name]['alpha'] - self.log_ratio).sum()
 
                 # PER PARAMS ALPHA
                 if self.pp_alpha:
@@ -246,13 +246,13 @@ class DiffPruning:
                 else:  # only base alpha
                     z2 = torch.ones_like(z.data)
 
-                self.grad_params[name][0] += self.bert_params[name][1] * z2
-                self.grad_params[name][1] += z * z2
-                self.grad_params[name][2] += z_grad
-                self.grad_params[name][3] += self.bert_params[name][1] * z
+                self.grad_params[name]['df/dz'] += self.bert_params[name]['w'] * z2
+                self.grad_params[name]['df/dw'] += z * z2
+                self.grad_params[name]['dz/dalpha'] += z_grad
+                self.grad_params[name]['df/dz2'] += self.bert_params[name]['w'] * z
 
-                param.data.copy_(self.bert_params[name][0].data +
-                                 (z * z2).data * self.bert_params[name][1].data)
+                param.data.copy_(self.bert_params[name]['pretrained'].data +
+                                 (z * z2).data * self.bert_params[name]['w'].data)
                 nonzero_params += ((z * z2) > 0).float().detach().sum().item()
                 prev_layer_ind = layer_ind
         return l0_penalty_sum, nonzero_params
@@ -261,23 +261,23 @@ class DiffPruning:
         for name, param in self.model.named_parameters():
             if "classifier" in name:
                 # copying updated gradient to the respective w vector
-                self.bert_params[name][1].grad += param.grad.data
+                self.bert_params[name]['w'].grad += param.grad.data
             else:
                 # adding grad to w
-                self.bert_params[name][1].grad += param.grad.data * self.grad_params[name][1].data
+                self.bert_params[name]['w'].grad += param.grad.data * self.grad_params[name]['df/dw'].data
                 # adding grad to base alpha
-                self.bert_params[name][2].grad += param.grad.data * \
-                                                  self.grad_params[name][0].data * \
-                                                  self.grad_params[name][2].data
+                self.bert_params[name]['alpha'].grad += param.grad.data * \
+                                                  self.grad_params[name]['df/dz'].data * \
+                                                  self.grad_params[name]['dz/dalpha'].data
                 # adding grad to per param / per layer alpha
                 if self.pp_alpha:
                     self.per_params_alpha[name].grad += torch.sum(param.grad.data *
-                                                                  self.grad_params[name][3].data *
+                                                                  self.grad_params[name]['df/dz2'].data *
                                                                   self.per_params_z_grad[name].data)
                 elif self.pl_alpha:
                     layer_ind = self._get_layer_ind(name)
                     self.per_layer_alpha[layer_ind].grad += torch.sum(param.grad.data *
-                                                                      self.grad_params[name][3].data *
+                                                                      self.grad_params[name]['df/dz2'].data *
                                                                       self.per_layer_z_grad[layer_ind].data)
 
     def __clip_grad_norms(self) -> NoReturn:
@@ -314,9 +314,9 @@ class DiffPruning:
             else:
                 decay['params'].append(diff)
 
-            self.bert_params[name] = [pretrained, diff, alpha]  # all parameters
-            self.diff.append(self.bert_params[name][1])  # only diff vector w
-            self.alpha.append(self.bert_params[name][2])  # only diff vector alpha
+            self.bert_params[name] = {'pretrained': pretrained, 'w': diff, 'alpha': alpha}  # all parameters
+            self.diff.append(self.bert_params[name]['w'])
+            self.alpha.append(self.bert_params[name]['alpha'])
 
             # PER PARAMS ALPHA
             if self.pp_alpha:
@@ -389,7 +389,8 @@ class DiffPruning:
     def __zero_grad(self) -> NoReturn:
         for name, param in self.model.named_parameters():
             if "classifier" not in name:
-                self.grad_params[name] = [torch.zeros_like(self.bert_params[name][1]) for _ in range(4)]
+                self.grad_params[name] = {grad: torch.zeros_like(self.bert_params[name]['w'])
+                                          for grad in ['df/dz', 'df/dw', 'dz/dalpha', 'df/dz2']}
                 if self.pp_alpha:
                     self.per_params_z_grad[name] = torch.zeros_like(self.per_params_alpha[name])
         if self.pl_alpha:
@@ -411,10 +412,10 @@ class DiffPruning:
         for _, batch in enumerate(epoch_iterator):
             for name, param in self.model.named_parameters():
                 if "classifier" in name:
-                    param.data.copy_(self.bert_params[name][0].data + self.bert_params[name][1].data)
+                    param.data.copy_(self.bert_params[name]['pretrained'].data + self.bert_params[name]['w'].data)
                 else:
                     layer_ind = self._get_layer_ind(name)
-                    z = self.concrete_stretched(self.bert_params[name][2], return_grad=False)
+                    z = self.concrete_stretched(self.bert_params[name]['alpha'], return_grad=False)
                     if self.pp_alpha:  # per params alpha
                         z2 = self.concrete_stretched(self.per_params_alpha[name], return_grad=False)
                     elif self.pl_alpha:  # per layer alpha
@@ -422,8 +423,8 @@ class DiffPruning:
                     else:  # only base alpha
                         z2 = torch.ones_like(z.data)
 
-                    param.data.copy_(self.bert_params[name][0].data +
-                                     (z * z2).data * self.bert_params[name][1].data)
+                    param.data.copy_(self.bert_params[name]['pretrained'].data +
+                                     (z * z2).data * self.bert_params[name]['w'].data)
 
             output = self.forward(batch)
             total_loss += output.loss.item()

@@ -1,3 +1,3 @@
 .DS_Store
-../log_old.txt
+log.txt
 __pycache__
