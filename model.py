@@ -441,6 +441,11 @@ class DiffPruning:
                 transformers model output
         """
         input_ids, attention_mask, token_type_ids, labels = batch
+        device = self.model.device
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        token_type_ids = token_type_ids.to(device)
+        labels = labels.to(device)
         output = self.model(input_ids=input_ids,
                             attention_mask=attention_mask,
                             token_type_ids=token_type_ids,
