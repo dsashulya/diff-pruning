@@ -3,18 +3,26 @@ from model import DiffPruning
 from transformers import BertForSequenceClassification, BertTokenizer
 import torch
 from torch.utils.data import TensorDataset, DataLoader, DistributedSampler
-from torch import distributed as distrib
+import torch.multiprocessing as mp
+from torch import distributed as dist
 import logging
-
+import os
 
 MODEL_CLASSES = {
     "bert": {"model": BertForSequenceClassification, "tokenizer": BertTokenizer},
 }
 
 
+def setup_distributed(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    torch.distributed.init_process_group("gloo", rank=rank, world_size=world_size)
+
+
 def setup_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument('--local_rank', default=-1, type=int, required=False)
+    parser.add_argument('--world_size', default=1, type=int, required=False)
     parser.add_argument('--logging_level', default=20, type=int, required=False)
     parser.add_argument('--model_name_or_path', default='bert-base-uncased', type=str, required=False,
                         help="used in model_class.from_pretrained()")
@@ -39,7 +47,11 @@ def setup_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--warmup_steps', default=0, type=int, required=False)
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int, required=False)
     parser.add_argument('--max_grad_norm', default=1., type=float, required=False)
-    parser.add_argument('--device', default="cuda", type=str, required=False)
+
+    # train params
+    parser.add_argument('--epochs', default=5, type=int, required=True)
+    parser.add_argument('--write', default=1, type=lambda x: bool(int(x)), required=False,
+                        help="write logs to summary writer")
     return parser
 
 
@@ -58,21 +70,19 @@ def prepare_dataloader(data, labels, tokenizer, batch_size):
         encodings["token_type_ids"],
         torch.tensor(labels, dtype=torch.long)
     )
-    distributed = distrib.is_available() and distrib.is_initialized()
+    distributed = dist.is_available() and dist.is_initialized()
     sampler = None
     if distributed:
-        sampler = DistributedSampler(data, num_replicas=distrib.get_world_size(), rank=distrib.get_rank())
+        sampler = DistributedSampler(data, num_replicas=dist.get_world_size(), rank=dist.get_rank())
     return DataLoader(dataset, batch_size=batch_size, num_workers=1 if distributed else 0, sampler=sampler,
                       shuffle=sampler is None)
 
 
-def main():
-    args = setup_argparser().parse_args()
+def train(local_rank, args):
     logging.basicConfig(filename="log.txt", filemode='a', level=args.logging_level)
 
     if args.local_rank != -1:
-        torch.cuda.set_device(args.local_rank)
-        distrib.init_process_group("nccl")
+        setup_distributed(local_rank, args.world_size)
 
     model_class, tokenizer_class = MODEL_CLASSES[args.model_name].values()
     model = model_class.from_pretrained(args.model_name_or_path)
@@ -104,10 +114,17 @@ def main():
                              warmup_steps=args.warmup_steps,
                              gradient_accumulation_steps=args.gradient_accumulation_steps,
                              max_grad_norm=args.max_grad_norm,
-                             local_rank=args.local_rank,
-                             device=args.device)
-    diff_model.train(train_dataloader, val_dataloader, 3, write=False)
+                             local_rank=args.local_rank)
+
+    diff_model.train(local_rank, train_dataloader, val_dataloader, write=False)
 
 
 if __name__ == "__main__":
-    main()
+    args = setup_argparser().parse_args()
+    if args.local_rank != -1:
+        mp.spawn(train,
+                 args=(args,),
+                 nprocs=args.world_size,
+                 join=True)
+    else:
+        train(args.local_rank, args)
