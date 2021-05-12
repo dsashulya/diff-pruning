@@ -8,11 +8,12 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm, trange
 from log import setup_logging
 
+
 NO_DECAY = ["bias", "LayerNorm.weight"]
 
 
 class ConcreteStretched:
-    def __init__(self, l: float, r: float, device="cuda"):
+    def __init__(self, l: float, r: float):
         """
        Parameters:
            l: float
@@ -20,7 +21,6 @@ class ConcreteStretched:
            r: float
                constant used to stretch s (r > 1)
        """
-        self.device = device
         self.l = l
         self.r = r
         self.logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ class DiffPruning:
         self.max_grad_norm = max_grad_norm
         self.alpha_init = alpha_init
         self.log_ratio = self._get_log_ratio(concrete_lower, concrete_upper)
-        self.concrete_stretched = ConcreteStretched(concrete_lower, concrete_upper, device)
+        self.concrete_stretched = ConcreteStretched(concrete_lower, concrete_upper)
 
         self.weight_decay = weight_decay
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -339,20 +339,31 @@ class DiffPruning:
             string += f"\n\tnorms = {np.array(norms).mean(axis=0)}"
         self.logger.info(string)
 
-    def __prepare_scheduler(self, train_dataloader: DataLoader, epochs: int) -> NoReturn:
+    def __log_start_training(self, train_dataloader, epochs, t_total) -> NoReturn:
+        self.logger.info("***** Running training *****")
+        self.logger.info(f"  Num examples = {len(train_dataloader)}")
+        self.logger.info(f"  Num Epochs = {epochs}")
+        self.logger.info(f"  Batch size = {train_dataloader.batch_size}")
+        self.logger.info(f"  Gradient Accumulation steps = {self.gradient_accumulation_steps}")
+        self.logger.info(f"  Total optimization steps = {t_total}")
+
+    def __prepare_scheduler(self, train_dataloader: DataLoader, epochs: int, max_steps: int) -> Tuple[int, int]:
         """ Creates schedulers for diff and alpha """
-        training_steps = len(train_dataloader) // self.gradient_accumulation_steps * epochs
-        if self.gradient_accumulation_steps > len(train_dataloader):
-            training_steps = epochs
+        if max_steps > 0:
+            t_total = max_steps
+            epochs = max_steps // (len(train_dataloader) // self.gradient_accumulation_steps) + 1
+        else:
+            t_total = len(train_dataloader) // self.gradient_accumulation_steps * epochs
 
         self.scheduler_params = get_linear_schedule_with_warmup(
             self.optimizer_params, num_warmup_steps=self.warmup_steps,
-            num_training_steps=training_steps
+            num_training_steps=t_total
         )
         self.scheduler_alpha = get_linear_schedule_with_warmup(
             self.optimizer_alpha, num_warmup_steps=self.warmup_steps,
-            num_training_steps=training_steps
+            num_training_steps=t_total
         )
+        return epochs, t_total
 
     def __step(self) -> NoReturn:
         self.optimizer_params.step()
@@ -428,8 +439,8 @@ class DiffPruning:
                             labels=labels)
         return output
 
-    def train(self, local_rank, train_dataloader: DataLoader, val_dataloader: DataLoader = None, epochs: int = 5,
-              write: bool = True) -> NoReturn:
+    def train(self, local_rank, train_dataloader: DataLoader, val_dataloader: DataLoader = None,
+              epochs: int = 5, max_steps: int = -1, logging_steps: int = 5, write: bool = True) -> NoReturn:
         """
         Parameters:
             local_rank: int
@@ -456,7 +467,7 @@ class DiffPruning:
         elif torch.cuda.is_available():
             self.model.to("cuda")
 
-        self.__prepare_scheduler(train_dataloader, epochs)
+        epochs, t_total = self.__prepare_scheduler(train_dataloader, epochs, max_steps)
         self.model.zero_grad()
         train_losses = []
         l0_penalties = []
@@ -464,6 +475,8 @@ class DiffPruning:
         nonzero = []
         update_steps = 0
 
+        if local_rank in [-1, 0]:
+            self.__log_start_training(train_dataloader, epochs, t_total)
         train_iterator = trange(0, epochs, desc="Epoch")
         for epoch in train_iterator:
             if isinstance(train_dataloader.sampler, DistributedSampler):
@@ -496,6 +509,11 @@ class DiffPruning:
                         avg_val_loss = self.evaluate(val_dataloader)
                         val_losses.append(avg_val_loss)
 
+                # logging
+                if local_rank in [-1, 0] and logging_steps > 0 and update_steps % logging_steps == 0:
+                    self.__log_epoch(epoch, update_steps, train_losses,
+                                     val_losses, nonzero, l0_penalties, norm=False)
+
                     # tensorboard
                     if writer is not None:
                         writer.add_scalar('training loss',
@@ -516,10 +534,6 @@ class DiffPruning:
                                               -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
                                           update_steps)
 
-            # logging epoch
-            self.__log_epoch(epoch, update_steps, train_losses,
-                             val_losses, nonzero, l0_penalties, norm=False)
-
-            train_losses = []
-            l0_penalties = []
-            val_losses = []
+                    train_losses = []
+                    l0_penalties = []
+                    val_losses = []

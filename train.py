@@ -7,10 +7,20 @@ import torch.multiprocessing as mp
 from torch import distributed as dist
 import logging
 import os
+import random
+import numpy as np
 
 MODEL_CLASSES = {
     "bert": {"model": BertForSequenceClassification, "tokenizer": BertTokenizer},
 }
+
+
+def set_seed(args):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.n_gpu > 0:
+        torch.cuda.manual_seed_all(args.seed)
 
 
 def setup_distributed(rank, world_size):
@@ -21,8 +31,10 @@ def setup_distributed(rank, world_size):
 
 def setup_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', default=10, type=int, required=False)
     parser.add_argument('--local_rank', default=-1, type=int, required=False)
     parser.add_argument('--world_size', default=1, type=int, required=False)
+    parser.add_argument('--n_gpu', default=1, type=int, required=False)
     parser.add_argument('--logging_level', default=20, type=int, required=False)
     parser.add_argument('--model_name_or_path', default='bert-base-uncased', type=str, required=False,
                         help="used in model_class.from_pretrained()")
@@ -47,9 +59,12 @@ def setup_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--warmup_steps', default=0, type=int, required=False)
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int, required=False)
     parser.add_argument('--max_grad_norm', default=1., type=float, required=False)
+    parser.add_argument("--max_steps", default=-1, type=int,
+                        help="If > 0: set total number of training steps to perform. Override num_train_epochs.")
 
     # train params
-    parser.add_argument('--epochs', default=5, type=int, required=True)
+    parser.add_argument('--num_train_epochs', default=5, type=int, required=True)
+    parser.add_argument('--logging_steps', default=5, type=int, required=False)
     parser.add_argument('--write', default=1, type=lambda x: bool(int(x)), required=False,
                         help="write logs to summary writer")
     return parser
@@ -84,9 +99,17 @@ def train(local_rank, args):
     if args.local_rank != -1:
         setup_distributed(local_rank, args.world_size)
 
+    # Make sure only the first process in distributed training will download model & vocab
+    if local_rank not in [-1, 0]:
+        torch.distributed.barrier()
+
     model_class, tokenizer_class = MODEL_CLASSES[args.model_name].values()
-    model = model_class.from_pretrained(args.model_name_or_path)
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name, do_lower_case=args.do_lower_case)
+    model = model_class.from_pretrained(args.model_name_or_path)
+
+    # Make sure only the first process in distributed training will download model & vocab
+    if local_rank == 0:
+        torch.distributed.barrier()
 
     train_data = ["This is the first sentence.",
                   "This is the second sentence.",
@@ -115,8 +138,14 @@ def train(local_rank, args):
                              gradient_accumulation_steps=args.gradient_accumulation_steps,
                              max_grad_norm=args.max_grad_norm,
                              local_rank=args.local_rank)
-
-    diff_model.train(local_rank, train_dataloader, val_dataloader, write=False)
+    set_seed(args)
+    diff_model.train(local_rank=local_rank,
+                     train_dataloader=train_dataloader,
+                     val_dataloader=val_dataloader,
+                     epochs=args.num_train_epochs,
+                     max_steps=args.max_steps,
+                     logging_steps=args.logging_steps,
+                     write=args.write)
 
 
 if __name__ == "__main__":
