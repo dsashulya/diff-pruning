@@ -1,6 +1,9 @@
 import argparse
 from model import DiffPruning
-from transformers import BertForSequenceClassification, BertTokenizer
+from transformers import (
+    BertForQuestionAnswering, BertForSequenceClassification, BertTokenizer,
+    DistilBertForQuestionAnswering, DistilBertForSequenceClassification, DistilBertTokenizer
+)
 import torch
 from torch.utils.data import TensorDataset, DataLoader, DistributedSampler
 import torch.multiprocessing as mp
@@ -12,6 +15,7 @@ import numpy as np
 
 MODEL_CLASSES = {
     "bert": {"model": BertForSequenceClassification, "tokenizer": BertTokenizer},
+    "distilbert": {"model": DistilBertForSequenceClassification, "tokenizer": DistilBertTokenizer}
 }
 
 
@@ -61,12 +65,14 @@ def setup_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--max_grad_norm', default=1., type=float, required=False)
     parser.add_argument("--max_steps", default=-1, type=int,
                         help="If > 0: set total number of training steps to perform. Override num_train_epochs.")
+    parser.add_argument('--no_diff', default=0, type=lambda x: bool(int(x)), required=False)
 
     # train params
     parser.add_argument('--num_train_epochs', default=5, type=int, required=True)
     parser.add_argument('--logging_steps', default=5, type=int, required=False)
+    parser.add_argument('--eval_steps', default=5, type=int, required=False)
     parser.add_argument('--write', default=1, type=lambda x: bool(int(x)), required=False,
-                        help="write logs to summary writer")
+                        help="Write logs to summary writer")
     return parser
 
 
@@ -137,7 +143,8 @@ def train(local_rank, args):
                              warmup_steps=args.warmup_steps,
                              gradient_accumulation_steps=args.gradient_accumulation_steps,
                              max_grad_norm=args.max_grad_norm,
-                             local_rank=args.local_rank)
+                             local_rank=args.local_rank,
+                             no_diff=args.no_diff)
     set_seed(args)
     diff_model.train(local_rank=local_rank,
                      train_dataloader=train_dataloader,
