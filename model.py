@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm, trange
 from log import setup_logging
+from datetime import datetime
 
 
 NO_DECAY = ["bias", "LayerNorm.weight"]
@@ -56,7 +57,7 @@ class ConcreteStretched:
 
 
 class DiffPruning:
-    def __init__(self, model: nn.Module, model_name: str,
+    def __init__(self, model: nn.Module, model_name: str, task_name: str,
                  total_layers: int, weight_decay: float,
                  warmup_steps: int, gradient_accumulation_steps: int, max_grad_norm: float,
                  concrete_lower: float = -1.5, concrete_upper: float = 1.5,
@@ -105,6 +106,7 @@ class DiffPruning:
                 whether to fine tune using diff pruning
         """
         self.no_diff = no_diff
+        self.task_name = task_name
         self.model = model
         self.pp_alpha = per_params_alpha
         self.pl_alpha = per_layer_alpha
@@ -215,7 +217,7 @@ class DiffPruning:
         prev_layer_ind = -1
         # iterate over params, calculate all model params (params + z * z2 * w) and l0 penalty
         for name, param in self.model.named_parameters():
-            if "classifier" in name:
+            if "classifier" in name or "qa" in name:
                 nonzero_params += param.numel()
                 # classifier diff vec is added to pretrained w/o z (base params + w)
                 param.data.copy_(self.bert_params[name]['pretrained'].data + self.bert_params[name]['w'].data)
@@ -257,7 +259,7 @@ class DiffPruning:
     def __calculate_grads(self) -> NoReturn:
         device = 0 if torch.cuda.is_available() else "cpu"
         for name, param in self.model.named_parameters():
-            if "classifier" in name:
+            if "classifier" in name or "qa" in name:
                 # copying updated gradient to the respective w vector
                 self.bert_params[name]['w'].grad += param.grad.to(device)
             else:
@@ -356,8 +358,9 @@ class DiffPruning:
 
     def __log_start_training(self, train_dataloader, epochs, t_total) -> NoReturn:
         self.logger.info("***** Running training *****")
+        self.logger.info(f"  Model name = {self.model_name}")
         self.logger.info(f"  Diff mode = {not self.no_diff}")
-        self.logger.info(f"  Num examples = {len(train_dataloader)}")
+        self.logger.info(f"  Num batches = {len(train_dataloader)}")
         self.logger.info(f"  Num Epochs = {epochs}")
         self.logger.info(f"  Batch size = {train_dataloader.batch_size}")
         self.logger.info(f"  Gradient Accumulation steps = {self.gradient_accumulation_steps}")
@@ -410,7 +413,7 @@ class DiffPruning:
         for name, param in self.model.named_parameters():
             if self.local_rank != -1 and "module" not in name:
                 name = "module." + name
-            if "classifier" not in name:
+            if "classifier" not in name and "qa" not in name:
                 self.grad_params[name] = {grad: torch.zeros_like(self.bert_params[name]['w'])
                                           for grad in ['df/dz', 'df/dw', 'dz/dalpha', 'df/dz2']}
                 if self.pp_alpha:
@@ -434,7 +437,7 @@ class DiffPruning:
         for _, batch in enumerate(epoch_iterator):
             if not self.no_diff:
                 for name, param in self.model.named_parameters():
-                    if "classifier" in name:
+                    if "classifier" in name or "qa" in name:
                         param.data.copy_(self.bert_params[name]['pretrained'].data + self.bert_params[name]['w'].data)
                     else:
                         layer_ind = self._get_layer_ind(name)
@@ -463,15 +466,32 @@ class DiffPruning:
             output
                 transformers model output
         """
-        input_ids, attention_mask, token_type_ids, labels = batch
+        input_ids, attention_mask, token_type_ids, start_positions, end_positions = batch
         output = self.model(input_ids=input_ids,
                             attention_mask=attention_mask,
                             token_type_ids=token_type_ids,
-                            labels=labels)
+                            start_positions=start_positions,
+                            end_positions=end_positions)
         return output
 
+    def load(self, path_params: str = None, path_bert_params: str = None):
+        if not self.no_diff:
+            self.bert_params = torch.load(path_bert_params)
+        else:
+            self.model.load_state_dict(torch.load(path_params))
+
+    def save(self, path_params: str = None, path_bert_params: str = None):
+        if not self.no_diff:
+            info_dict = {"bert_params": self.bert_params}
+            torch.save(info_dict, path_bert_params)
+        else:
+            model_to_save = (
+                self.model.module if hasattr(self.model, "module") else self.model
+            )
+            torch.save(model_to_save.state_dict(), path_params)
+
     def train(self, local_rank: int, train_dataloader: DataLoader, val_dataloader: DataLoader = None,
-              epochs: int = 5, max_steps: int = -1, logging_steps: int = 5, eval_steps: int = 5,
+              epochs: int = 5, max_steps: int = -1, logging_steps: int = 5, eval_steps: int = 5, save_steps: int = 50,
               write: bool = True) -> NoReturn:
         """
         Parameters:
@@ -490,10 +510,12 @@ class DiffPruning:
             write: bool
                 write to tensorboard
         """
+        # added to the saving files
+        saving_name = f'{self.model_name}-{datetime.now():%Y%m%d-%H%M-%S}'
         # preparing summary writer
         writer = None
         if write:
-            writer = setup_logging(self.model_name)
+            writer = setup_logging(self.model_name + '_no_diff' if self.no_diff else '_diff')
 
         self.__setup_distributed(local_rank)
         epochs, t_total = self.__prepare_scheduler(train_dataloader, epochs, max_steps)
@@ -541,36 +563,42 @@ class DiffPruning:
                     self.__step()
                     update_steps += 1
 
-                    if val_dataloader is not None and update_steps % eval_steps == 0:
+                    if val_dataloader is not None and local_rank in [-1, 0] and update_steps % eval_steps == 0:
                         avg_val_loss = self.evaluate(val_dataloader)
                         val_losses.append(avg_val_loss)
 
-                # logging
-                if local_rank in [-1, 0] and logging_steps > 0 and update_steps % logging_steps == 0:
-                    self.__log_epoch(epoch, update_steps, train_losses,
-                                     val_losses, nonzero, l0_penalties, norm=False)
-
-                    # tensorboard
-                    if writer is not None:
-                        writer.add_scalar('training loss',
-                                          sum(train_losses[
-                                              -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
-                                          update_steps)
-                        if val_dataloader is not None:
-                            writer.add_scalar('validation loss',
-                                              sum(val_losses[
-                                                -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
-                                              update_steps)
+                    if local_rank in [-1, 0] and update_steps % save_steps == 0:
                         if not self.no_diff:
-                            writer.add_scalar('L0 penalty',
-                                              sum(l0_penalties[
-                                                -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
-                                              update_steps)
-                            writer.add_scalar('Nonzero params count',
-                                              sum(nonzero[
-                                                -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
-                                              update_steps)
+                            self.save(path_bert_params=f"bert_params_{saving_name}.pt")
+                        else:
+                            self.save(path_params=f"no_diff_{saving_name}.pt")
 
-                    train_losses = []
-                    l0_penalties = []
-                    val_losses = []
+                    # logging
+                    if local_rank in [-1, 0] and logging_steps > 0 and update_steps % logging_steps == 0:
+                        self.__log_epoch(epoch, update_steps, train_losses,
+                                         val_losses, nonzero, l0_penalties, norm=False)
+
+                        # tensorboard
+                        if writer is not None:
+                            writer.add_scalar('training loss',
+                                              sum(train_losses[
+                                                  -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
+                                              update_steps)
+                            if val_dataloader is not None:
+                                writer.add_scalar('validation loss',
+                                                  sum(val_losses[
+                                                    -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
+                                                  update_steps)
+                            if not self.no_diff:
+                                writer.add_scalar('L0 penalty',
+                                                  sum(l0_penalties[
+                                                    -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
+                                                  update_steps)
+                                writer.add_scalar('Nonzero params count',
+                                                  sum(nonzero[
+                                                    -self.gradient_accumulation_steps:]) / self.gradient_accumulation_steps,
+                                                  update_steps)
+
+                        train_losses = []
+                        l0_penalties = []
+                        val_losses = []
