@@ -9,6 +9,17 @@ Sources:
 - without diff vector
   - Exact Match:   76.8%
   - F1:   85.2%
+ 
+
+Parameter  | Value
+------------ | -------------
+epochs       | 3
+learning rate| 2e-5
+weight decay | 0.01
+batch size   | 8 per GPU
+\# of GPUs   | 2
+
+
 
 Training loss              |  Validation loss
 :-------------------------:|:-------------------------:
