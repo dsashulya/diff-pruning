@@ -7,8 +7,8 @@ Sources:
 
 **Task 1**: finetuning [DistilBertForQuestionAnswering](https://huggingface.co/transformers/model_doc/distilbert.html#distilbertforquestionanswering) on [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/)
 - without diff vector
-  - Exact Match:   75.8%
-  - F1:   84.4%
+  - Exact Match:   76.8%
+  - F1:   85.2%
 
 Training loss              |  Validation loss
 :-------------------------:|:-------------------------:
