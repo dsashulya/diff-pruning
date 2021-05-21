@@ -61,7 +61,7 @@ class DiffPruning:
                  total_layers: int, weight_decay: float,
                  warmup_steps: int, gradient_accumulation_steps: int, max_grad_norm: float,
                  concrete_lower: float = -1.5, concrete_upper: float = 1.5,
-                 sparsity_penalty: float = 1.25e-7,
+                 sparsity_penalty: float = 1.25e-7, lambda_increase_steps: int = 0,
                  lr_params: float = 2e-5, lr_alpha: float = 2e-5, eps: float = 1e-8,
                  alpha_init: float = 0., per_params_alpha: bool = False, per_layer_alpha: bool = False,
                  device: Union[str, torch.device] = "cuda", local_rank: int = -1, world_size: int = 1,
@@ -107,6 +107,7 @@ class DiffPruning:
         """
         self.lr_params = lr_params
         self.lr_alpha = lr_alpha
+        self.eps = eps
         self.no_diff = no_diff
         self.task_name = task_name
         self.model = model
@@ -125,24 +126,20 @@ class DiffPruning:
         self.weight_decay = weight_decay
         self.gradient_accumulation_steps = gradient_accumulation_steps
 
-        if not self.no_diff:
-            self.bert_params = {}
-            self.diff = []
-            self.alpha = []
-            self.optimiser_grouped_parameters = []
-            self.per_params_alpha = None
-            self.per_layer_alpha = None
-            self.grad_params = {}
-            self.per_params_z_grad = {}
-            self.per_layer_z_grad = []
-            # initialising parameters
-            self.__get_params()
-            self.optimizer_params = AdamW(self.optimiser_grouped_parameters, lr=lr_params, eps=eps)
-            self.optimizer_alpha = AdamW(self.alpha, lr=lr_alpha, eps=eps, weight_decay=self.weight_decay)
-            self.sparsity_penalty = sparsity_penalty
-            self.scheduler_alpha = None
-        else:
-            self.optimizer_params = AdamW(self.model.parameters(), lr=lr_params, eps=eps)
+        self.sparsity_penalty = sparsity_penalty
+        self.lambda_increase_steps = lambda_increase_steps
+        self.scheduler_alpha = None
+
+        self.bert_params = {}
+        self.diff = []
+        self.alpha = []
+        self.optimiser_grouped_parameters = []
+        self.per_params_alpha = None
+        self.per_layer_alpha = None
+        self.grad_params = {}
+        self.per_params_z_grad = {}
+        self.per_layer_z_grad = []
+        self.__initialize()
 
         self.warmup_steps = warmup_steps
         self.scheduler_params = None
@@ -150,6 +147,23 @@ class DiffPruning:
 
         # logging
         self.logger = logging.getLogger(__name__)
+
+    def __initialize(self):
+        if not self.no_diff:
+            self.diff = []
+            self.alpha = []
+            self.optimiser_grouped_parameters = []
+            self.per_params_alpha = None
+            self.per_layer_alpha = None
+            # initialising parameters
+            if not len(self.bert_params):
+                self.__get_params()
+            else:
+                self.__get_params(model_load=True)
+            self.optimizer_params = AdamW(self.optimiser_grouped_parameters, lr=self.lr_params, eps=self.eps)
+            self.optimizer_alpha = AdamW(self.alpha, lr=self.lr_alpha, eps=self.eps, weight_decay=self.weight_decay)
+        else:
+            self.optimizer_params = AdamW(self.model.parameters(), lr=self.lr_params, eps=self.eps)
 
     def _get_layer_ind(self, layer_name: str) -> int:
         """
@@ -297,7 +311,7 @@ class DiffPruning:
                 lr = param_group['lr']
         return lr
 
-    def __get_params(self) -> NoReturn:
+    def __get_params(self, model_load=False) -> NoReturn:
         """
         Extracts model parameters and initialises w and alpha
         """
@@ -309,13 +323,19 @@ class DiffPruning:
             self.per_params_alpha = {}
 
         for name, param in self.model.named_parameters():
-            if self.local_rank != -1:
+            if self.local_rank != -1 and "module." not in name:
                 name = "module." + name
-            pretrained = torch.zeros_like(param.data, requires_grad=False).copy_(param).to(self.device)
-            diff = torch.zeros_like(param.data, requires_grad=True, device=self.device)
-            alpha = torch.zeros_like(param.data, device=self.device) + self.alpha_init
-            # diff.requires_grad = True
-            alpha.requires_grad = True
+            if model_load:
+                pretrained = self.bert_params[name]['pretrained']
+                diff = self.bert_params[name]['w']
+                alpha = self.bert_params[name]['alpha']
+                param.data.copy_(self.bert_params[name]['pretrained'])
+            else:
+                pretrained = torch.zeros_like(param.data, requires_grad=False).copy_(param).to(self.device)
+                diff = torch.zeros_like(param.data, requires_grad=True, device=self.device)
+                alpha = torch.zeros_like(param.data, device=self.device) + self.alpha_init
+                # diff.requires_grad = True
+                alpha.requires_grad = True
 
             diff.grad = torch.zeros_like(diff)
             alpha.grad = torch.zeros_like(alpha)
@@ -325,7 +345,8 @@ class DiffPruning:
             else:
                 decay['params'].append(diff)
 
-            self.bert_params[name] = {'pretrained': pretrained, 'w': diff, 'alpha': alpha}  # all parameters
+            if not model_load:
+                self.bert_params[name] = {'pretrained': pretrained, 'w': diff, 'alpha': alpha}  # all parameters
             self.alpha.append(self.bert_params[name]['alpha'])
             self.diff.append(self.bert_params[name]['w'])
 
@@ -518,16 +539,30 @@ class DiffPruning:
                                     labels=labels)
         return output
 
-    def load(self, path: str = None):
-        if not self.no_diff:
+    def load(self, path: str = None, no_diff_load=False, train=False):
+        # when loading diff model in diff mode
+        if not self.no_diff and not no_diff_load:
             bert_params = torch.load(path)['bert_params']
-            for key, value in bert_params.items():
-                if "module" in key:
-                    key = '.'.join(key.split('.')[1:])
-                self.bert_params[key] = value
-            _, _ = self.__calculate_params(no_grads=True)
-        else:
+            if self.local_rank == -1:
+                for key, value in bert_params.items():
+                    if "module" in key:
+                        key = '.'.join(key.split('.')[1:])
+                    self.bert_params[key] = value
+            else:
+                self.bert_params = bert_params
+            # when loading diff model to evaluate
+            if not train:
+                _, _ = self.__calculate_params(no_grads=True)
+            # when loading diff model to train
+            else:
+                self.__initialize()
+        # when loading a no diff model in both diff / no diff modes
+        elif self.no_diff or no_diff_load:
             self.model.load_state_dict(torch.load(path))
+            # when loading no_diff model to fine tune with diff
+            if not self.no_diff:
+                self.__initialize()
+        self.logger.info(f"     Model loaded from checkpoint {path}")
 
     def save(self, path_params: str = None, path_bert_params: str = None):
         if not self.no_diff:
@@ -541,7 +576,7 @@ class DiffPruning:
 
     def train(self, local_rank: int, train_dataloader: DataLoader, val_dataloader: DataLoader = None,
               epochs: int = 5, max_steps: int = -1, logging_steps: int = 5, eval_steps: int = 5, save_steps: int = 50,
-              write: bool = True) -> NoReturn:
+              write: bool = True, update_steps_start: int = 0, eval_func = None, label_map = None) -> NoReturn:
         """
         Parameters:
             local_rank: int
@@ -573,10 +608,16 @@ class DiffPruning:
         l0_penalties = []
         val_losses = []
         nonzero = []
-        update_steps = 0
+        update_steps = update_steps_start
+        best_val_loss = np.inf
 
         if local_rank in [-1, 0]:
             self.__log_start_training(train_dataloader, epochs, t_total)
+
+        if not self.no_diff and self.lambda_increase_steps:
+            target_sparsity_penalty = self.sparsity_penalty
+            self.sparsity_penalty = 0.
+            sparsity_penalty_step = target_sparsity_penalty / self.lambda_increase_steps
 
         train_iterator = trange(0, epochs, desc="Epoch")
         for epoch in train_iterator:
@@ -587,6 +628,8 @@ class DiffPruning:
                 l0_penalty_sum = None
                 if not self.no_diff:
                     l0_penalty_sum, nonzero_params = self.__calculate_params()
+                    if self.lambda_increase_steps and self.sparsity_penalty < target_sparsity_penalty:
+                        self.sparsity_penalty += sparsity_penalty_step
                     l0_penalty_sum *= self.sparsity_penalty
 
                 # forward pass
@@ -615,12 +658,18 @@ class DiffPruning:
                     if val_dataloader is not None and local_rank in [-1, 0] and update_steps % eval_steps == 0:
                         avg_val_loss = self.evaluate(val_dataloader)
                         val_losses.append(avg_val_loss)
+                        if avg_val_loss < best_val_loss:
+                            if not self.no_diff:
+                                self.save(path_bert_params=f"bert_params_{saving_name}_best.pt")
+                            else:
+                                self.save(path_params=f"no_diff_{saving_name}_best.pt")
+                            best_val_loss = avg_val_loss
 
                     if local_rank in [-1, 0] and update_steps % save_steps == 0:
                         if not self.no_diff:
-                            self.save(path_bert_params=f"bert_params_{saving_name}.pt")
+                            self.save(path_bert_params=f"bert_params_{saving_name}_last.pt")
                         else:
-                            self.save(path_params=f"no_diff_{saving_name}.pt")
+                            self.save(path_params=f"no_diff_{saving_name}_last.pt")
 
                     # logging
                     if local_rank in [-1, 0] and logging_steps > 0 and update_steps % logging_steps == 0:
@@ -650,6 +699,18 @@ class DiffPruning:
                                                   update_steps)
                                 writer.add_scalar('Nonzero params count',
                                                   int(np.array(nonzero).mean()),
+                                                  update_steps)
+                                if self.lambda_increase_steps:
+                                    writer.add_scalar('Sparsity penalty',
+                                                      self.sparsity_penalty,
+                                                      update_steps)
+                            if eval_func is not None and local_rank in [-1, 0] and update_steps % eval_steps == 0:
+                                metrics = eval_func(self, val_dataloader, label_map)
+                                writer.add_scalar('Precision',
+                                                  metrics['precision'],
+                                                  update_steps)
+                                writer.add_scalar('F1 score',
+                                                  metrics['f1'],
                                                   update_steps)
 
                         train_losses = []
