@@ -13,12 +13,7 @@ def tokens_to_dataloader(tokenized_examples, batch_size, task_name='squad', shuf
             torch.tensor(tokenized_examples["end_positions"], dtype=torch.long)
         )
     else:
-        dataset = TensorDataset(
-            torch.tensor(tokenized_examples["input_ids"], dtype=torch.long),
-            torch.tensor(tokenized_examples["attention_mask"], dtype=torch.long),
-            torch.tensor(tokenized_examples["token_type_ids"], dtype=torch.long),
-            torch.tensor(tokenized_examples["labels"], dtype=torch.long)
-        )
+        dataset = tokenized_examples
 
     distributed = dist.is_available() and dist.is_initialized()
     sampler = None

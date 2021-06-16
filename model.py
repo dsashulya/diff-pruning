@@ -8,6 +8,8 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm, trange
 from log import setup_logging
 from datetime import datetime
+from ner_utils import align_predictions
+from seqeval.metrics import precision_score, recall_score, f1_score
 
 
 NO_DECAY = ["bias", "LayerNorm.weight"]
@@ -219,7 +221,7 @@ class DiffPruning:
         if l0_penalty is not None:
             l0_penalty.backward()
 
-    def __calculate_params(self, no_grads=False) -> Tuple[torch.Tensor, int]:
+    def _calculate_params(self, no_grads=False) -> Tuple[torch.Tensor, int]:
         """
         Copies trained parameters into the model
         Returns:
@@ -306,10 +308,12 @@ class DiffPruning:
     @staticmethod
     def __get_optimizer_lr(optimizer) -> float:
         lr = 0.
+        cnt = 0
         for param_group in optimizer.param_groups:
-            if param_group['weight_decay']:
-                lr = param_group['lr']
-        return lr
+            lr += param_group['lr']
+            cnt += 1
+
+        return lr / cnt if cnt != 0 else lr
 
     def __get_params(self, model_load=False) -> NoReturn:
         """
@@ -464,7 +468,7 @@ class DiffPruning:
             self.per_layer_z_grad = [0] * self.total_layers
 
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader) -> float:
+    def evaluate(self, dataloader: DataLoader, label_map = None):
         """
         Parameters:
             dataloader: torch.utils.data.Dataloader
@@ -476,29 +480,42 @@ class DiffPruning:
         total_loss = 0.
         self.model.eval()
         epoch_iterator = tqdm(dataloader, desc="Val iteration", position=0, leave=True)
+
+        if not self.no_diff:
+            for name, param in self.model.named_parameters():
+                if "classifier" in name or "qa" in name:
+                    param.data.copy_(self.bert_params[name]['pretrained'].data + self.bert_params[name]['w'].data)
+                else:
+                    layer_ind = self._get_layer_ind(name)
+                    z = self.concrete_stretched(self.bert_params[name]['alpha'], return_grad=False)
+                    if self.pp_alpha:  # per params alpha
+                        z2 = self.concrete_stretched(self.per_params_alpha[name], return_grad=False)
+                    elif self.pl_alpha:  # per layer alpha
+                        z2 = self.concrete_stretched(self.per_layer_alpha[layer_ind], return_grad=False)
+                    else:  # only base alpha
+                        z2 = torch.ones_like(z.data)
+
+                    param.data.copy_(self.bert_params[name]['pretrained'].data +
+                                     (z * z2).data * self.bert_params[name]['w'].data)
+        pr, rec, f1 = 0., 0., 0.
         for _, batch in enumerate(epoch_iterator):
-            if not self.no_diff:
-                for name, param in self.model.named_parameters():
-                    if "classifier" in name or "qa" in name:
-                        param.data.copy_(self.bert_params[name]['pretrained'].data + self.bert_params[name]['w'].data)
-                    else:
-                        layer_ind = self._get_layer_ind(name)
-                        z = self.concrete_stretched(self.bert_params[name]['alpha'], return_grad=False)
-                        if self.pp_alpha:  # per params alpha
-                            z2 = self.concrete_stretched(self.per_params_alpha[name], return_grad=False)
-                        elif self.pl_alpha:  # per layer alpha
-                            z2 = self.concrete_stretched(self.per_layer_alpha[layer_ind], return_grad=False)
-                        else:  # only base alpha
-                            z2 = torch.ones_like(z.data)
-
-                        param.data.copy_(self.bert_params[name]['pretrained'].data +
-                                         (z * z2).data * self.bert_params[name]['w'].data)
-
-            output = self.forward([item.to(self.model.device) for item in batch])
+            if isinstance(batch, list):
+                output = self.forward([item.to(self.model.device) for item in batch])
+            else:
+                output = self.forward({key: value.to(self.model.device) for key, value in batch.items()})
             total_loss += output.loss.detach().item()
-        return total_loss / len(dataloader)
+            pred, labels = align_predictions(output.logits.detach().cpu().numpy(),
+                                             batch['labels'].cpu().numpy(), label_map)
+            pr += precision_score(labels, pred, zero_division=0)
+            rec += recall_score(labels, pred, zero_division=0)
+            f1 += f1_score(labels, pred, zero_division=0)
+        return total_loss / len(dataloader), {
+        "precision": pr / len(dataloader),
+        "recall": rec / len(dataloader),
+        "f1": f1 / len(dataloader)
+    }
 
-    def forward(self, batch: list):
+    def forward(self, batch):
         """
         Computes a forward pass through the tuned model
         Parameters:
@@ -527,22 +544,25 @@ class DiffPruning:
                                     start_positions=start_positions,
                                     end_positions=end_positions)
         else:
-            input_ids, attention_mask, token_type_ids, labels = batch
-            if self.model_name != 'distilbert':
-                output = self.model(input_ids=input_ids,
-                                    attention_mask=attention_mask,
-                                    token_type_ids=token_type_ids,
-                                    labels=labels)
+            if isinstance(batch, list):
+                input_ids, attention_mask, token_type_ids, labels = batch
+                if self.model_name != 'distilbert':
+                    output = self.model(input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        token_type_ids=token_type_ids,
+                                        labels=labels)
+                else:
+                    output = self.model(input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        labels=labels)
             else:
-                output = self.model(input_ids=input_ids,
-                                    attention_mask=attention_mask,
-                                    labels=labels)
+                output = self.model(**batch)
         return output
 
     def load(self, path: str = None, no_diff_load=False, train=False):
         # when loading diff model in diff mode
         if not self.no_diff and not no_diff_load:
-            bert_params = torch.load(path)['bert_params']
+            bert_params = torch.load(path, map_location=self.device)['bert_params']
             if self.local_rank == -1:
                 for key, value in bert_params.items():
                     if "module" in key:
@@ -552,7 +572,7 @@ class DiffPruning:
                 self.bert_params = bert_params
             # when loading diff model to evaluate
             if not train:
-                _, _ = self.__calculate_params(no_grads=True)
+                _, _ = self._calculate_params(no_grads=True)
             # when loading diff model to train
             else:
                 self.__initialize()
@@ -627,14 +647,17 @@ class DiffPruning:
             for step, batch in enumerate(epoch_iterator):
                 l0_penalty_sum = None
                 if not self.no_diff:
-                    l0_penalty_sum, nonzero_params = self.__calculate_params()
+                    l0_penalty_sum, nonzero_params = self._calculate_params()
                     if self.lambda_increase_steps and self.sparsity_penalty < target_sparsity_penalty:
                         self.sparsity_penalty += sparsity_penalty_step
                     l0_penalty_sum *= self.sparsity_penalty
 
                 # forward pass
                 self.model.train()
-                output = self.forward([item.to(self.model.device) for item in batch])
+                if isinstance(batch, list):
+                    output = self.forward([item.to(self.model.device) for item in batch])
+                else:
+                    output = self.forward({key: value.to(self.model.device) for key, value in batch.items()})
                 loss = output.loss
                 train_losses.append(loss.detach().item())
                 if not self.no_diff:
@@ -655,8 +678,9 @@ class DiffPruning:
                     self.__step()
                     update_steps += 1
 
+                    metrics = None
                     if val_dataloader is not None and local_rank in [-1, 0] and update_steps % eval_steps == 0:
-                        avg_val_loss = self.evaluate(val_dataloader)
+                        avg_val_loss, metrics = self.evaluate(val_dataloader, label_map)
                         val_losses.append(avg_val_loss)
                         if avg_val_loss < best_val_loss:
                             if not self.no_diff:
@@ -672,7 +696,8 @@ class DiffPruning:
                             self.save(path_params=f"no_diff_{saving_name}_last.pt")
 
                     # logging
-                    if local_rank in [-1, 0] and logging_steps > 0 and update_steps % logging_steps == 0:
+                    if local_rank in [-1, 0] and logging_steps > 0 and (update_steps % logging_steps == 0
+                                                                        or update_steps == update_steps_start):
                         self.__log_epoch(epoch, update_steps, train_losses,
                                          val_losses, nonzero, l0_penalties, norm=False)
 
@@ -681,18 +706,18 @@ class DiffPruning:
                             writer.add_scalar('training loss',
                                               np.array(train_losses).mean(),
                                               update_steps)
-                            if val_dataloader is not None and update_steps % eval_steps == 0:
+                            if val_dataloader is not None and update_steps % eval_steps == 0 and val_losses:
                                 writer.add_scalar('validation loss',
                                                   np.array(val_losses).mean(),
                                                   update_steps)
-                            if self.weight_decay:
-                                writer.add_scalar('LR params',
-                                                  self.__get_optimizer_lr(self.optimizer_params),
+
+                            writer.add_scalar('LR params',
+                                              self.__get_optimizer_lr(self.optimizer_params),
+                                              update_steps)
+                            if not self.no_diff:
+                                writer.add_scalar('LR alpha',
+                                                  self.__get_optimizer_lr(self.optimizer_alpha),
                                                   update_steps)
-                                if not self.no_diff:
-                                    writer.add_scalar('LR alpha',
-                                                      self.__get_optimizer_lr(self.optimizer_alpha),
-                                                      update_steps)
                             if not self.no_diff:
                                 writer.add_scalar('L0 penalty',
                                                   np.array(l0_penalties).mean(),
@@ -704,10 +729,14 @@ class DiffPruning:
                                     writer.add_scalar('Sparsity penalty',
                                                       self.sparsity_penalty,
                                                       update_steps)
-                            if eval_func is not None and local_rank in [-1, 0] and update_steps % eval_steps == 0:
-                                metrics = eval_func(self, val_dataloader, label_map)
+                            # if eval_func is not None and local_rank in [-1, 0] and update_steps % eval_steps == 0:
+                            if metrics is not None:
+                                # metrics = eval_func(self, val_dataloader, label_map)
                                 writer.add_scalar('Precision',
                                                   metrics['precision'],
+                                                  update_steps)
+                                writer.add_scalar('Recall',
+                                                  metrics['recall'],
                                                   update_steps)
                                 writer.add_scalar('F1 score',
                                                   metrics['f1'],

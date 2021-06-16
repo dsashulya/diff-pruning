@@ -11,7 +11,6 @@ from datasets import load_dataset, load_metric
 from tqdm import tqdm
 from transformers import (
     AutoModelForQuestionAnswering,
-    AutoConfig,
     AutoTokenizer,
     BertForQuestionAnswering,
     BertForTokenClassification,
@@ -23,9 +22,8 @@ from transformers import (
 )
 
 from model import DiffPruning
+from ner_utils import get_bc2gm_train_data, evaluate_ner_metrics, build_dict, UTIL_TAGS
 from squad_utils import get_train_data, get_validation_data, postprocess_qa_predictions
-from ner_utils import get_labels, get_bc2gm_train_data, evaluate_ner_metrics
-
 
 MODEL_CLASSES = {'qa': {
     "bert": {"model": BertForQuestionAnswering,
@@ -62,7 +60,8 @@ def init_model(args, model):
                        gradient_accumulation_steps=args.gradient_accumulation_steps,
                        max_grad_norm=args.max_grad_norm,
                        local_rank=args.local_rank,
-                       no_diff=args.no_diff)
+                       no_diff=args.no_diff,
+                       device="cuda" if torch.cuda.is_available() else "cpu")
 
 
 def set_seed(args):
@@ -136,7 +135,7 @@ def setup_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--eval_steps', default=5, type=int, required=False)
     parser.add_argument('--write', default=True, type=lambda x: bool(int(x)), required=False,
                         help="Write logs to summary writer")
-    parser.add_argument('--save_steps', type=int, default=50,
+    parser.add_argument('--save_steps', type=int, default=10,
                         help="Save last checkpoint every X update steps")
     parser.add_argument('--update_steps_start', type=int, default=0,
                         help="when using pretrained model enter how many update steps it already underwent")
@@ -144,7 +143,7 @@ def setup_argparser() -> argparse.ArgumentParser:
 
 
 @torch.no_grad()
-def eval(args):
+def eval_squad(args):
     filename = f"log_{args.task_name}_" + ("diff.txt" if not args.no_diff else "no_diff.txt")
     logging.basicConfig(filename=filename, filemode='a', level=args.logging_level)
     logger = logging.getLogger(__name__)
@@ -163,7 +162,7 @@ def eval(args):
 
     dataloader, tokenized_examples = get_validation_data(args, tokenizer)
     all_start_logits, all_end_logits = None, None
-    # getting logits
+
     for batch in tqdm(dataloader, position=0, leave=True):
         batch = [element.to(model.device) for element in batch]
         output = diff_model.forward(batch)
@@ -188,8 +187,46 @@ def eval(args):
     logger.info(f'METRICS: {metrics}')
 
 
+@torch.no_grad()
+def eval_ner(args):
+    label2id: Dict[str, int] = build_dict(UTIL_TAGS + ['GENE'], ['B-', 'I-', 'E-', 'S-'])
+    label_map = {value: key for key, value in label2id.items()}
+    num_labels = len(label_map)
+
+    model_class, config_class, tokenizer_class = MODEL_CLASSES[args.task_name][args.model_name].values()
+    config = config_class.from_pretrained(
+        args.model_name_or_path,
+        num_labels=num_labels,
+        id2label=label_map,
+        label2id=label2id,
+    )
+
+    tokenizer = tokenizer_class.from_pretrained(
+        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+        use_fast=args.use_fast
+    )
+    model = model_class.from_pretrained(
+        args.model_name_or_path,
+        from_tf=bool(".ckpt" in args.model_name_or_path),
+        config=config
+    ).to("cuda" if torch.cuda.is_available() else "cpu")
+    _, dataloader = get_bc2gm_train_data(args, tokenizer, return_train=False, return_val=True, tags_vocab=label2id)
+    diff_model = init_model(args, model)
+    if args.model_checkpoint:
+        if args.load_diff_checkpoint:
+            diff_model.load(args.model_checkpoint, train=False)
+        else:
+            diff_model.load(args.model_checkpoint, no_diff_load=True)
+    set_seed(args)
+    metrics = evaluate_ner_metrics(diff_model, dataloader, label_map)
+    nonzero, _ = diff_model._calculate_params(no_grads=True)
+    print(metrics)
+    print(nonzero.item())
+    print(nonzero.item() / 110_000_000 * 100)
+
+
 def train(local_rank, args):
-    filename = f"log_{args.task_name}_" + ("diff.txt" if not args.no_diff else "no_diff.txt")
+    filename = f"log_{args.task_name}_" + ("diff_.txt" if not args.no_diff else "no_diff.txt")
     logging.basicConfig(filename=filename, filemode='a', level=args.logging_level)
 
     if args.local_rank != -1:
@@ -202,16 +239,15 @@ def train(local_rank, args):
     model_class, config_class, tokenizer_class = MODEL_CLASSES[args.task_name][args.model_name].values()
 
     if args.task_name == 'ner':
-        labels = get_labels(args.path_to_train)
-        label_map: Dict[int, str] = {i: label for i, label in enumerate(labels)}
-        print(label_map)
-        num_labels = len(labels)
+        label2id: Dict[str, int] = build_dict(UTIL_TAGS + ['GENE'], ['B-', 'I-', 'E-', 'S-'])
+        label_map = {value: key for key, value in label2id.items()}
+        num_labels = len(label_map)
 
         config = config_class.from_pretrained(
             args.model_name_or_path,
             num_labels=num_labels,
             id2label=label_map,
-            label2id={label: i for i, label in enumerate(labels)},
+            label2id=label2id,
         )
     else:
         config = config_class.from_pretrained(
@@ -232,7 +268,8 @@ def train(local_rank, args):
                                                           tokenizer=tokenizer,
                                                           return_val=True)
     elif args.task_name == 'ner':
-        train_dataloader, val_dataloader = get_bc2gm_train_data(args, tokenizer, return_val=True)
+        train_dataloader, val_dataloader = get_bc2gm_train_data(args, tokenizer, tags_vocab=label2id, return_val=True)
+
     else:
         train_dataloader, val_dataloader = None, None
 
@@ -275,4 +312,7 @@ if __name__ == "__main__":
         else:
             train(args.local_rank, args)
     elif args.do_eval:
-        eval(args)
+        if args.task_name == 'squad':
+            eval_squad(args)
+        else:
+            eval_ner(args)
