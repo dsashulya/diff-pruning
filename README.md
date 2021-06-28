@@ -5,7 +5,7 @@ Sources:
 
 ## Results
 
-**Task 1**: finetuning [BioBERT](https://github.com/dmis-lab/biobert-pytorch) with diff-vector on [BC2GM](https://drive.google.com/file/d/1OletxmPYNkz2ltOr9pyT0b0iBtUWxslh/view)
+**Task 1**: finetuning [BioBERT](https://github.com/dmis-lab/biobert-pytorch) with diff-vector on [BC2GM](https://github.com/cambridgeltl/MTL-Bioinformatics-2016/tree/master/data/BC2GM-IOBES)
 
   - Precision:   87.69
   - Recall:   85.31
@@ -22,7 +22,7 @@ batch size   | 32
 
 
 
-**Task 2**: diff pruning [BioBERT](https://github.com/dmis-lab/biobert-pytorch) with diff-vector on [BC2GM](https://drive.google.com/file/d/1OletxmPYNkz2ltOr9pyT0b0iBtUWxslh/view)
+**Task 2**: diff pruning [BioBERT](https://github.com/dmis-lab/biobert-pytorch) with diff-vector on [BC2GM](https://github.com/cambridgeltl/MTL-Bioinformatics-2016/tree/master/data/BC2GM-IOBES)
 Parameter  | Value
 ------------ | -------------
 epochs       | 160
