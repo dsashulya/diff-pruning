@@ -1,16 +1,18 @@
-import numpy as np
 import logging
-from typing import Tuple, List, Union, NoReturn
+from datetime import datetime
+from typing import Tuple, Union, NoReturn
+
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm, trange
-from log import setup_logging
-from datetime import datetime
-from ner_utils import align_predictions
-from seqeval.metrics import precision_score, recall_score, f1_score
+from transformers import AdamW, get_linear_schedule_with_warmup
 
+from data import get_ner_model_inputs
+from loss import loss as ner_loss
+from log import setup_logging, write_params, log_epoch, log_start_training
+from ner_utils import evaluate_ner_metrics
 
 NO_DECAY = ["bias", "LayerNorm.weight"]
 
@@ -115,7 +117,6 @@ class DiffPruning:
         self.model = model
         self.pp_alpha = per_params_alpha
         self.pl_alpha = per_layer_alpha
-        self.device = device
         self.local_rank = local_rank
         self.world_size = world_size
         self.model_name = model_name.lower()
@@ -146,17 +147,21 @@ class DiffPruning:
         self.warmup_steps = warmup_steps
         self.scheduler_params = None
 
-
         # logging
         self.logger = logging.getLogger(__name__)
+
+    @property
+    def device(self):
+        return self.model.device
+
+    def __call__(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
 
     def __initialize(self):
         if not self.no_diff:
             self.diff = []
             self.alpha = []
             self.optimiser_grouped_parameters = []
-            self.per_params_alpha = None
-            self.per_layer_alpha = None
             # initialising parameters
             if not len(self.bert_params):
                 self.__get_params()
@@ -201,16 +206,6 @@ class DiffPruning:
             return 0
         return np.log(-concrete_lower / concrete_upper)
 
-    def _calculate_param_norms(self, order: int = 2) -> List[List[float]]:
-        norms = []
-        for name, _ in self.model.named_parameters():
-            bert, diff, alpha = self.bert_params[name].values()
-            norms.append([torch.linalg.norm(bert, ord=order).item(),
-                          torch.linalg.norm(diff, ord=order).item(),
-                          torch.linalg.norm(alpha, ord=order).item()
-                          ])
-        return norms
-
     def __backward(self, loss: torch.Tensor, l0_penalty: torch.Tensor = None) -> NoReturn:
         if self.gradient_accumulation_steps > 1:
             loss /= self.gradient_accumulation_steps
@@ -250,6 +245,7 @@ class DiffPruning:
 
                 # PER PARAMS ALPHA
                 if self.pp_alpha:
+                    # print(self.per_params_alpha[name])
                     z2, z2_grad = self.concrete_stretched(self.per_params_alpha[name])
                     self.per_params_z_grad[name] += z2_grad
                     l0_penalty_sum += torch.sigmoid(self.per_params_alpha[name] - self.log_ratio).sum()
@@ -276,7 +272,7 @@ class DiffPruning:
         return l0_penalty_sum, nonzero_params
 
     def __calculate_grads(self) -> NoReturn:
-        device = 0 if torch.cuda.is_available() else "cpu"
+        device = self.device
         for name, param in self.model.named_parameters():
             if "classifier" in name or "qa" in name:
                 # copying updated gradient to the respective w vector
@@ -323,10 +319,16 @@ class DiffPruning:
             "Structured diff pruning can only be used either per params or per layer"
         decay = {'params': [], 'weight_decay': self.weight_decay}
         no_decay = {'params': [], 'weight_decay': 0.}
-        if self.pp_alpha:
+        if self.pp_alpha and self.per_params_alpha is None:
             self.per_params_alpha = {}
+        elif self.per_params_alpha is not None:
+            self.alpha.extend(self.per_params_alpha.values())
+        if self.pl_alpha and self.per_layer_alpha is None:
+            self.per_layer_alpha = []
+        elif self.per_layer_alpha is not None:
+            self.alpha.extend(self.per_layer_alpha)
 
-        for name, param in self.model.named_parameters():
+        for i, (name, param) in enumerate(self.model.named_parameters()):
             if self.local_rank != -1 and "module." not in name:
                 name = "module." + name
             if model_load:
@@ -338,7 +340,6 @@ class DiffPruning:
                 pretrained = torch.zeros_like(param.data, requires_grad=False).copy_(param).to(self.device)
                 diff = torch.zeros_like(param.data, requires_grad=True, device=self.device)
                 alpha = torch.zeros_like(param.data, device=self.device) + self.alpha_init
-                # diff.requires_grad = True
                 alpha.requires_grad = True
 
             diff.grad = torch.zeros_like(diff)
@@ -355,7 +356,7 @@ class DiffPruning:
             self.diff.append(self.bert_params[name]['w'])
 
             # PER PARAMS ALPHA
-            if self.pp_alpha:
+            if self.per_params_alpha is not None and len(self.per_params_alpha) == i:
                 alpha = torch.zeros(1).to(self.device) + self.alpha_init
                 alpha.requires_grad = True
                 alpha.grad = torch.zeros_like(alpha)
@@ -363,8 +364,7 @@ class DiffPruning:
                 self.alpha.append(alpha)
 
         # PER LAYER ALPHA
-        if self.pl_alpha:
-            self.per_layer_alpha = []
+        if self.per_layer_alpha is not None and len(self.per_layer_alpha) == 0:
             for i in range(self.total_layers):
                 self.per_layer_alpha.append(torch.zeros(1).to(self.device) + self.alpha_init)
                 self.per_layer_alpha[i].requires_grad = True
@@ -375,42 +375,6 @@ class DiffPruning:
         self.__zero_grad()
         assert len(self.bert_params) and len(self.diff) and len(self.alpha), "Parameters were not initialised"
         assert len(self.grad_params), "Gradients were not initialised"
-
-    def __log_epoch(self, epoch: int, update_steps: int, train_losses: list,
-                    val_losses: list, nonzero_params: list = None,
-                    l0_penalties: list = None, norm: bool = False) -> NoReturn:
-        string = f"Epoch {epoch + 1} | Update step {update_steps} average values:" + \
-                 f"\n\ttrain loss = {np.array(train_losses).mean():.3f} "
-        if len(val_losses):
-            string += f"val loss = {np.array(val_losses).mean():.3f}"
-
-        if not self.no_diff:
-            string += f"\n\tnonzero params = {np.array(nonzero_params).mean():,.0f}" + \
-                      f"\n\tL0 penalty = {np.array(l0_penalties).mean():,.3f}"
-        if norm:
-            norms = self._calculate_param_norms()
-            string += f"\n\tnorms = {np.array(norms).mean(axis=0)}"
-        self.logger.info(string)
-
-    def __log_start_training(self, train_dataloader, epochs, t_total) -> NoReturn:
-        self.logger.info(f"***** Running training *****")
-        self.logger.info(f"  Model name = {self.model_name}")
-        self.logger.info(f"  Diff mode = {not self.no_diff}")
-        self.logger.info(f"  Num batches = {len(train_dataloader)}")
-        self.logger.info(f"  Num Epochs = {epochs}")
-        self.logger.info(f"  Batch size = {train_dataloader.batch_size}")
-        self.logger.info(f"  Gradient Accumulation steps = {self.gradient_accumulation_steps}")
-        self.logger.info(f"  Total optimization steps = {t_total}")
-        self.logger.info(f"  Weight decay = {self.weight_decay}")
-        self.logger.info(f"  Concrete lower = {self.concrete_stretched.l}")
-        self.logger.info(f"  Concrete upper = {self.concrete_stretched.r}")
-        if not self.no_diff:
-            self.logger.info(f"  Params LR = {self.lr_params}, Alpha LR {self.lr_alpha}")
-            self.logger.info(f"  Sparsity penalty = {self.sparsity_penalty}")
-            self.logger.info(f"  Per params alpha = {self.pp_alpha}")
-            self.logger.info(f"  Per layer alpha = {self.pl_alpha}")
-        else:
-            self.logger.info(f"  Params LR = {self.lr_params}")
 
     def __prepare_scheduler(self, train_dataloader: DataLoader, epochs: int, max_steps: int) -> Tuple[int, int]:
         """ Creates schedulers for diff and alpha """
@@ -442,11 +406,11 @@ class DiffPruning:
 
     def __step(self) -> NoReturn:
         self.optimizer_params.step()
-        self.scheduler_params.step()
+        # self.scheduler_params.step()
 
         if not self.no_diff:
             self.optimizer_alpha.step()
-            self.scheduler_alpha.step()
+            # self.scheduler_alpha.step()
 
         self.model.zero_grad()
         self.optimizer_params.zero_grad()
@@ -468,7 +432,7 @@ class DiffPruning:
             self.per_layer_z_grad = [0] * self.total_layers
 
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader, label_map = None):
+    def evaluate(self, dataloader: DataLoader, label_map=None, tokenizer=None):
         """
         Parameters:
             dataloader: torch.utils.data.Dataloader
@@ -477,9 +441,7 @@ class DiffPruning:
             avg_loss: float
                 average loss across the data
         """
-        total_loss = 0.
         self.model.eval()
-        epoch_iterator = tqdm(dataloader, desc="Val iteration", position=0, leave=True)
 
         if not self.no_diff:
             for name, param in self.model.named_parameters():
@@ -497,72 +459,13 @@ class DiffPruning:
 
                     param.data.copy_(self.bert_params[name]['pretrained'].data +
                                      (z * z2).data * self.bert_params[name]['w'].data)
-        pr, rec, f1 = 0., 0., 0.
-        for _, batch in enumerate(epoch_iterator):
-            if isinstance(batch, list):
-                output = self.forward([item.to(self.model.device) for item in batch])
-            else:
-                output = self.forward({key: value.to(self.model.device) for key, value in batch.items()})
-            total_loss += output.loss.detach().item()
-            pred, labels = align_predictions(output.logits.detach().cpu().numpy(),
-                                             batch['labels'].cpu().numpy(), label_map)
-            pr += precision_score(labels, pred, zero_division=0)
-            rec += recall_score(labels, pred, zero_division=0)
-            f1 += f1_score(labels, pred, zero_division=0)
-        return total_loss / len(dataloader), {
-        "precision": pr / len(dataloader),
-        "recall": rec / len(dataloader),
-        "f1": f1 / len(dataloader)
-    }
-
-    def forward(self, batch):
-        """
-        Computes a forward pass through the tuned model
-        Parameters:
-            batch: list
-                [input_ids, attention_mask, token_type_ids, labels]
-        Returns:
-            output
-                transformers model output
-        """
-        if self.task_name == "squad":
-            start_positions, end_positions = None, None
-            if len(batch) > 3:
-                input_ids, attention_mask, token_type_ids, start_positions, end_positions = batch
-            else:
-                input_ids, attention_mask, token_type_ids = batch
-
-            if self.model_name != 'distilbert':
-                output = self.model(input_ids=input_ids,
-                                    attention_mask=attention_mask,
-                                    token_type_ids=token_type_ids,
-                                    start_positions=start_positions,
-                                    end_positions=end_positions)
-            else:
-                output = self.model(input_ids=input_ids,
-                                    attention_mask=attention_mask,
-                                    start_positions=start_positions,
-                                    end_positions=end_positions)
-        else:
-            if isinstance(batch, list):
-                input_ids, attention_mask, token_type_ids, labels = batch
-                if self.model_name != 'distilbert':
-                    output = self.model(input_ids=input_ids,
-                                        attention_mask=attention_mask,
-                                        token_type_ids=token_type_ids,
-                                        labels=labels)
-                else:
-                    output = self.model(input_ids=input_ids,
-                                        attention_mask=attention_mask,
-                                        labels=labels)
-            else:
-                output = self.model(**batch)
-        return output
+        return evaluate_ner_metrics(self, dataloader, label_map, tokenizer)
 
     def load(self, path: str = None, no_diff_load=False, train=False):
         # when loading diff model in diff mode
         if not self.no_diff and not no_diff_load:
-            bert_params = torch.load(path, map_location=self.device)['bert_params']
+            params = torch.load(path, map_location=self.device)
+            bert_params = params['bert_params']
             if self.local_rank == -1:
                 for key, value in bert_params.items():
                     if "module" in key:
@@ -570,6 +473,10 @@ class DiffPruning:
                     self.bert_params[key] = value
             else:
                 self.bert_params = bert_params
+            if 'per_params_alpha' in params:
+                self.per_params_alpha = params['per_params_alpha']
+            if 'per_layer_alpha' in params:
+                self.per_layer_alpha = params['per_layer_alpha']
             # when loading diff model to evaluate
             if not train:
                 _, _ = self._calculate_params(no_grads=True)
@@ -587,6 +494,10 @@ class DiffPruning:
     def save(self, path_params: str = None, path_bert_params: str = None):
         if not self.no_diff:
             info_dict = {"bert_params": self.bert_params}
+            if self.pp_alpha:
+                info_dict["per_params_alpha"] = self.per_params_alpha
+            if self.pl_alpha:
+                info_dict["per_layer_alpha"] = self.per_layer_alpha
             torch.save(info_dict, path_bert_params)
         else:
             model_to_save = (
@@ -594,9 +505,9 @@ class DiffPruning:
             )
             torch.save(model_to_save.state_dict(), path_params)
 
-    def train(self, local_rank: int, train_dataloader: DataLoader, val_dataloader: DataLoader = None,
+    def train(self, local_rank: int, args, train_dataloader: DataLoader, val_dataloader: DataLoader = None,
               epochs: int = 5, max_steps: int = -1, logging_steps: int = 5, eval_steps: int = 5, save_steps: int = 50,
-              write: bool = True, update_steps_start: int = 0, eval_func = None, label_map = None) -> NoReturn:
+              write: bool = True, update_steps_start: int = 0, eval_func=None, label_map=None, tokenizer=None) -> NoReturn:
         """
         Parameters:
             local_rank: int
@@ -620,6 +531,7 @@ class DiffPruning:
         writer = None
         if write and local_rank in [-1, 0]:
             writer = setup_logging(self.task_name + '_' + self.model_name + ('_no_diff' if self.no_diff else '_diff'))
+        write_params(writer, args)
 
         self.__setup_distributed(local_rank)
         epochs, t_total = self.__prepare_scheduler(train_dataloader, epochs, max_steps)
@@ -627,12 +539,20 @@ class DiffPruning:
         train_losses = []
         l0_penalties = []
         val_losses = []
-        nonzero = []
         update_steps = update_steps_start
         best_val_loss = np.inf
+        tags_vocab = {value: key for key, value in label_map.items()}
 
         if local_rank in [-1, 0]:
-            self.__log_start_training(train_dataloader, epochs, t_total)
+            log_start_training(self.logger, args, train_dataloader, t_total)
+            if val_dataloader is not None:
+                _, _, = self._calculate_params(no_grads=True)
+                val_loss, metrics = evaluate_ner_metrics(self, val_dataloader, label_map, tokenizer)
+                if writer is not None:
+                    writer.add_scalar('Losses/val', val_loss, 0)
+                    writer.add_scalar('Metrics/f1_dev', metrics['f1'], 0)
+                    writer.add_scalar('Metrics/precision_dev', metrics['precision'], 0)
+                    writer.add_scalar('Metrics/recall_dev', metrics['recall'], 0)
 
         if not self.no_diff and self.lambda_increase_steps:
             target_sparsity_penalty = self.sparsity_penalty
@@ -654,11 +574,9 @@ class DiffPruning:
 
                 # forward pass
                 self.model.train()
-                if isinstance(batch, list):
-                    output = self.forward([item.to(self.model.device) for item in batch])
-                else:
-                    output = self.forward({key: value.to(self.model.device) for key, value in batch.items()})
-                loss = output.loss
+                batch = get_ner_model_inputs(batch, tokenizer, tags_vocab)
+                output = self.model(**{key: value.to(self.model.device) for key, value in batch.items()})
+                loss = ner_loss(output.logits.cpu(), batch['labels'], batch['attention_mask'])
                 train_losses.append(loss.detach().item())
                 if not self.no_diff:
                     l0_penalties.append(l0_penalty_sum.detach().item())
@@ -673,14 +591,14 @@ class DiffPruning:
                 ):
                     if not self.no_diff:
                         self.__calculate_grads()
-                        nonzero.append(nonzero_params)
                     self.__clip_grad_norms()
                     self.__step()
                     update_steps += 1
 
                     metrics = None
                     if val_dataloader is not None and local_rank in [-1, 0] and update_steps % eval_steps == 0:
-                        avg_val_loss, metrics = self.evaluate(val_dataloader, label_map)
+                        _, _, = self._calculate_params(no_grads=True)
+                        avg_val_loss, metrics = evaluate_ner_metrics(self, val_dataloader, label_map, tokenizer)
                         val_losses.append(avg_val_loss)
                         if avg_val_loss < best_val_loss:
                             if not self.no_diff:
@@ -696,52 +614,50 @@ class DiffPruning:
                             self.save(path_params=f"no_diff_{saving_name}_last.pt")
 
                     # logging
-                    if local_rank in [-1, 0] and logging_steps > 0 and (update_steps % logging_steps == 0
-                                                                        or update_steps == update_steps_start):
-                        self.__log_epoch(epoch, update_steps, train_losses,
-                                         val_losses, nonzero, l0_penalties, norm=False)
+                    if local_rank in [-1, 0] and logging_steps > 0 and update_steps % logging_steps == 0:
+                        log_epoch(self.logger,
+                                  epoch,
+                                  update_steps,
+                                  train_losses,
+                                  val_losses,
+                                  nonzero_params,
+                                  l0_penalties,
+                                  no_diff=self.no_diff)
 
                         # tensorboard
                         if writer is not None:
-                            writer.add_scalar('training loss',
+                            writer.add_scalar('Losses/train',
                                               np.array(train_losses).mean(),
                                               update_steps)
                             if val_dataloader is not None and update_steps % eval_steps == 0 and val_losses:
-                                writer.add_scalar('validation loss',
+                                writer.add_scalar('Losses/val',
                                                   np.array(val_losses).mean(),
                                                   update_steps)
 
-                            writer.add_scalar('LR params',
+                            writer.add_scalar('LR/w',
                                               self.__get_optimizer_lr(self.optimizer_params),
                                               update_steps)
                             if not self.no_diff:
-                                writer.add_scalar('LR alpha',
+                                writer.add_scalar('LR/alpha',
                                                   self.__get_optimizer_lr(self.optimizer_alpha),
                                                   update_steps)
-                            if not self.no_diff:
-                                writer.add_scalar('L0 penalty',
+                            if not self.no_diff and self.sparsity_penalty > 0.:
+                                writer.add_scalar('Diff/l0_penalty',
                                                   np.array(l0_penalties).mean(),
                                                   update_steps)
-                                writer.add_scalar('Nonzero params count',
-                                                  int(np.array(nonzero).mean()),
+                                writer.add_scalar('Diff/nonzero_count',
+                                                  int(nonzero_params),
                                                   update_steps)
-                                if self.lambda_increase_steps:
-                                    writer.add_scalar('Sparsity penalty',
-                                                      self.sparsity_penalty,
-                                                      update_steps)
-                            # if eval_func is not None and local_rank in [-1, 0] and update_steps % eval_steps == 0:
                             if metrics is not None:
-                                # metrics = eval_func(self, val_dataloader, label_map)
-                                writer.add_scalar('Precision',
-                                                  metrics['precision'],
-                                                  update_steps)
-                                writer.add_scalar('Recall',
-                                                  metrics['recall'],
-                                                  update_steps)
-                                writer.add_scalar('F1 score',
+                                writer.add_scalar('Metrics/f1_dev',
                                                   metrics['f1'],
                                                   update_steps)
-
+                                writer.add_scalar('Metrics/precision_dev',
+                                                  metrics['precision'],
+                                                  update_steps)
+                                writer.add_scalar('Metrics/recall_dev',
+                                                  metrics['recall'],
+                                                  update_steps)
                         train_losses = []
                         l0_penalties = []
                         val_losses = []

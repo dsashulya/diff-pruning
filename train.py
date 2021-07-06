@@ -25,6 +25,7 @@ from model import DiffPruning
 from ner_utils import get_bc2gm_train_data, evaluate_ner_metrics, build_dict, UTIL_TAGS
 from squad_utils import get_train_data, get_validation_data, postprocess_qa_predictions
 
+
 MODEL_CLASSES = {'qa': {
     "bert": {"model": BertForQuestionAnswering,
              "config": BertConfig,
@@ -218,8 +219,11 @@ def eval_ner(args):
         else:
             diff_model.load(args.model_checkpoint, no_diff_load=True)
     set_seed(args)
-    metrics = evaluate_ner_metrics(diff_model, dataloader, label_map)
+
+    # torch.save(diff_model.model.state_dict(), "bert_state_dict.pt")
     nonzero, _ = diff_model._calculate_params(no_grads=True)
+    metrics = evaluate_ner_metrics(diff_model, dataloader, label_map, tokenizer)
+
     print(metrics)
     print(nonzero.item())
     print(nonzero.item() / 110_000_000 * 100)
@@ -261,7 +265,7 @@ def train(local_rank, args):
         args.model_name_or_path,
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config
-    )
+    ).to("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.task_name == 'squad':
         train_dataloader, val_dataloader = get_train_data(args=args,
@@ -288,6 +292,7 @@ def train(local_rank, args):
 
     set_seed(args)
     diff_model.train(local_rank=local_rank,
+                     args=args,
                      train_dataloader=train_dataloader,
                      val_dataloader=val_dataloader,
                      epochs=args.num_train_epochs,
@@ -298,7 +303,8 @@ def train(local_rank, args):
                      write=args.write,
                      update_steps_start=args.update_steps_start,
                      eval_func=eval_func,
-                     label_map=label_map)
+                     label_map=label_map,
+                     tokenizer=tokenizer)
 
 
 if __name__ == "__main__":
