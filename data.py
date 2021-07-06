@@ -2,8 +2,33 @@ import torch
 from torch.utils.data import TensorDataset, DistributedSampler, DataLoader
 import torch.distributed as distrib
 from transformers import PreTrainedTokenizer
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
+from pathlib import Path
 from tags import START_TAG, END_TAG
+from ner_utils import create_mask, NerDataset, BioNerFileFormat, NerDatasetItem, encode_raw_ner_item
+from tqdm import tqdm
+
+
+def load_dataset(path, tokenizer: PreTrainedTokenizer, tags_vocab,
+                 cutoff: int = 200) -> NerDataset:
+    raw_items = BioNerFileFormat.deserialize(path.read_text().splitlines())
+    encoded_items: List[NerDatasetItem] = []
+    for i, item in enumerate(tqdm(raw_items)):
+        encoded_item = encode_raw_ner_item(item, tokenizer=tokenizer, cutoff=cutoff,
+                                           tags_vocab=tags_vocab)
+        encoded_items.append(encoded_item)
+    return NerDataset(encoded_items)
+
+
+def get_bc2gm_train_data(args, tokenizer, tags_vocab, return_val=True, return_train=True):
+    train_dataloader, val_dataloader = None, None
+    if return_train:
+        train_data = load_dataset(Path(args.path_to_train), tokenizer=tokenizer, tags_vocab=tags_vocab)
+        train_dataloader = tokens_to_dataloader(train_data, args.batch_size, 'ner')
+    if return_val:
+        val_data = load_dataset(Path(args.path_to_val), tokenizer=tokenizer, tags_vocab=tags_vocab)
+        val_dataloader = tokens_to_dataloader(val_data, args.batch_size, 'ner')
+    return train_dataloader, val_dataloader
 
 
 def tokens_to_dataloader(tokenized_examples, batch_size, task_name='squad', shuffle=False):
@@ -50,13 +75,6 @@ def insert_bounds(seqs: torch.Tensor, lens: torch.Tensor,
         new_seqs[range(lens.shape[0]), lens + change - 1] = end_code
 
     return new_seqs, new_lens
-
-
-def create_mask(target: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
-    mask = torch.arange(target.size(1), dtype=lens.dtype, device=lens.device).repeat(target.size(0), 1) < lens.unsqueeze(1)
-    for i in range(len(target.size()) - 2):
-        mask = mask.unsqueeze(-1)
-    return mask.to(dtype=int)
 
 
 class SequenceBatch:

@@ -22,7 +22,10 @@ from transformers import (
 )
 
 from model import DiffPruning
-from ner_utils import get_bc2gm_train_data, evaluate_ner_metrics, build_dict, UTIL_TAGS
+from ner_utils import build_dict
+from data import get_bc2gm_train_data
+from tags import UTIL_TAGS
+from eval import evaluate_ner_metrics
 from squad_utils import get_train_data, get_validation_data, postprocess_qa_predictions
 
 
@@ -61,8 +64,7 @@ def init_model(args, model):
                        gradient_accumulation_steps=args.gradient_accumulation_steps,
                        max_grad_norm=args.max_grad_norm,
                        local_rank=args.local_rank,
-                       no_diff=args.no_diff,
-                       device="cuda" if torch.cuda.is_available() else "cpu")
+                       no_diff=args.no_diff)
 
 
 def set_seed(args):
@@ -120,6 +122,7 @@ def setup_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--lr_alpha', default=5e-5, type=float, required=False)
     parser.add_argument('--per_layer_alpha', default=False, type=lambda x: bool(int(x)), required=False)
     parser.add_argument('--per_params_alpha', default=False, type=lambda x: bool(int(x)), required=False)
+    parser.add_argument('--scheduler', default='const', type=str, required=False)
     parser.add_argument('--warmup_steps', default=0, type=int, required=False)
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int, required=False)
     parser.add_argument('--lambda_increase_steps', default=0, type=int, required=False,
@@ -295,13 +298,6 @@ def train(local_rank, args):
                      args=args,
                      train_dataloader=train_dataloader,
                      val_dataloader=val_dataloader,
-                     epochs=args.num_train_epochs,
-                     max_steps=args.max_steps,
-                     logging_steps=args.logging_steps,
-                     save_steps=args.save_steps,
-                     eval_steps=args.eval_steps,
-                     write=args.write,
-                     update_steps_start=args.update_steps_start,
                      eval_func=eval_func,
                      label_map=label_map,
                      tokenizer=tokenizer)

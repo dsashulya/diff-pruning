@@ -1,17 +1,12 @@
-from pathlib import Path
-from typing import List, NamedTuple, Dict, Any, Optional, Tuple
+from typing import NamedTuple, Dict, Any
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset
-from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from data import get_ner_model_inputs
-from data import tokens_to_dataloader
 from tags import *
-from lm_model import loss as ner_loss
 
 
 class NerDatasetItem(NamedTuple):
@@ -186,114 +181,10 @@ class BioNerFileFormat:
         return result
 
 
-def load_dataset(path, tokenizer: PreTrainedTokenizer, tags_vocab,
-                 cutoff: int = 200) -> NerDataset:
-    raw_items = BioNerFileFormat.deserialize(path.read_text().splitlines())
-    encoded_items: List[NerDatasetItem] = []
-    for i, item in enumerate(tqdm(raw_items)):
-        encoded_item = encode_raw_ner_item(item, tokenizer=tokenizer, cutoff=cutoff,
-                                           tags_vocab=tags_vocab)
-        encoded_items.append(encoded_item)
-    return NerDataset(encoded_items)
-
-
-def get_bc2gm_train_data(args, tokenizer, tags_vocab, return_val=True, return_train=True):
-    train_dataloader, val_dataloader = None, None
-    if return_train:
-        train_data = load_dataset(Path(args.path_to_train), tokenizer=tokenizer, tags_vocab=tags_vocab)
-        train_dataloader = tokens_to_dataloader(train_data, args.batch_size, 'ner')
-    if return_val:
-        val_data = load_dataset(Path(args.path_to_val), tokenizer=tokenizer, tags_vocab=tags_vocab)
-        val_dataloader = tokens_to_dataloader(val_data, args.batch_size, 'ner')
-    return train_dataloader, val_dataloader
-
-
 def masked_softmax(inp: Tensor, mask: Tensor) -> Tensor:
     masked_input = inp * mask.unsqueeze(2).float()
     scores = F.softmax(masked_input, dim=2)
     return scores
-
-
-def predict(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    scores = masked_softmax(logits, mask)
-    scores = scores * mask.unsqueeze(2).float()
-    path = torch.max(scores, 2)[1]
-    path = path * mask.long()
-    return path
-
-
-def align_predictions(logits, mask, label_ids, label_map: dict):
-    pred = predict(logits, mask).numpy()
-    batch_size, seq_len = pred.shape
-    out_label_list = [[] for _ in range(batch_size)]
-    preds_list = [[] for _ in range(batch_size)]
-    for i in range(batch_size):
-        for j in range(seq_len):
-            if label_map[label_ids[i, j]] != 'PAD' and label_map[label_ids[i, j]] != 'UNK' \
-                    and label_map[pred[i, j]] != 'PAD' and label_map[pred[i, j]] != 'UNK':
-                out_label_list[i].append(label_map[label_ids[i, j]])
-                preds_list[i].append(label_map[pred[i, j]])
-    return preds_list, out_label_list
-
-
-def get_utils_tags_ids(vocab, util_tags: Optional[List[str]] = None) -> List[int]:
-    if util_tags is None:
-        util_tags = UTIL_TAGS
-    util_ids = list(sorted({id_ for tag, id_ in vocab.items() if tag in util_tags}))
-    assert max(util_ids) == len(util_ids) - 1  # check all util tags located at the start of vocab
-    return util_ids
-
-
-def update_confusion_matrix(conf_matrix: Tensor, actual: Tensor, predicted: Tensor, *, mask: Optional[Tensor] = None):
-    if mask is None:
-        mask = torch.ones_like(actual, dtype=torch.float32)
-
-    index = predicted * conf_matrix.size(1) + actual
-    conf_matrix.view(-1).index_add_(0, index, mask.float())
-
-
-def f1_score_micro_precision_recall(conf_matrix: Tensor, *, start: int = 0, end: Optional[int] = None) \
-        -> Tuple[Tensor, Tensor, Tensor]:
-    score = 0.
-    pr, p, r = 0., 0., 0.
-    for tag in range(start, conf_matrix.size(0) if end is None else end):
-        pr += conf_matrix[tag, tag].item()
-        p += torch.sum(conf_matrix[tag, :]).item()
-        r += torch.sum(conf_matrix[:, tag]).item()
-    try:
-        score = 2 * pr / (p + r)
-    except ZeroDivisionError:
-        pass
-    return torch.tensor(score), torch.tensor(pr / r), torch.tensor(pr / p)
-
-
-@torch.no_grad()
-def evaluate_ner_metrics(model, dataloader, label_map, tokenizer):
-    tags_vocab = {value: key for key, value in label_map.items()}
-    tags_num = len(tags_vocab)
-    skip_tags = len(get_utils_tags_ids(tags_vocab))
-    conf_matrix = torch.zeros((tags_num, tags_num), dtype=torch.float)
-    total_loss = 0.
-    for batch in tqdm(dataloader, position=0, leave=True, desc="Validation"):
-        batch = get_ner_model_inputs(batch, tokenizer, tags_vocab)
-        outputs = model(**{key: value.to(model.device) for key, value in batch.items()})
-        total_loss += ner_loss(outputs.logits.cpu(), batch['labels'],
-                               batch['attention_mask'])  # output.loss.detach().item()
-        predictions = predict(outputs.logits.cpu(), batch['attention_mask'])
-        update_confusion_matrix(conf_matrix,
-                                actual=batch['labels'].reshape(-1), predicted=predictions.reshape(-1))
-
-    # pred, labels = align_predictions(outputs.logits.detach().cpu(), batch['attention_mask'].cpu(),
-    #                                  labels.cpu().numpy(), label_map)
-    # pr += precision_score(labels, pred, mode='strict', scheme=IOBES, zero_division=0)
-    # rec += recall_score(labels, pred, mode='strict', scheme=IOBES, zero_division=0)
-    # f1 += f1_score(labels, pred, mode='strict', scheme=IOBES, zero_division=0)
-    f1, pr, rec = f1_score_micro_precision_recall(conf_matrix, start=skip_tags)
-    return total_loss / len(dataloader), {
-        "precision": pr.item(),
-        "recall": rec.item(),
-        "f1": f1.item()
-    }
 
 
 def create_mask(target: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:

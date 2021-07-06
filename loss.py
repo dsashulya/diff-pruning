@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from data import create_mask
+from ner_utils import create_mask
 
 def batch_cross_entropy_tensor(out: torch.Tensor, expected: torch.Tensor, exp_lens: torch.Tensor, mask_delta=0,
                                eps: float = 0.) -> torch.Tensor:
