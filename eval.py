@@ -40,6 +40,7 @@ def f1_score_micro_precision_recall(conf_matrix: Tensor, *, start: int = 0, end:
         pass
     return torch.tensor(score), torch.tensor(pr / r), torch.tensor(pr / p)
 
+
 @torch.no_grad()
 def evaluate_ner_metrics(model, dataloader, label_map, tokenizer):
     tags_vocab = {value: key for key, value in label_map.items()}

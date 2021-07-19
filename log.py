@@ -22,19 +22,19 @@ def setup_logging(model_name: str) -> SummaryWriter:
 
 
 def write_params(writer, args):
-    output = f'Model path {args.model_name_or_path}\n'
-    output += f'Task name {args.task_name}\n'
-    output += f'Epochs {args.num_train_epochs}\n'
-    output += f'W learning rate {args.lr_params}\n'
-    output += f'Alpha LR {args.lr_alpha}\n'
-    output += f'Sparsity penalty {args.sparsity_penalty}\n'
-    output += f'Alpha init {args.alpha_init}\n'
-    output += f'Weight decay {args.weight_decay}\n'
-    output += f'Batch size {args.batch_size}\n'
-    output += f'Per params alpha {args.per_params_alpha}\n'
-    output += f'Per layer alpha {args.per_layer_alpha}\n'
-    output += f'Concrete lower {args.concrete_lower}\n'
-    output += f'Concrete upper {args.concrete_upper}\n'
+    output = f'Model path {args.model_name_or_path}  \n'
+    output += f'Task name {args.task_name}  \n'
+    output += f'Epochs {args.num_train_epochs}  \n'
+    output += f'W learning rate {args.lr_params}  \n'
+    output += f'Alpha LR {args.lr_alpha}  \n'
+    output += f'Sparsity penalty {args.sparsity_penalty}  \n'
+    output += f'Alpha init {args.alpha_init}  \n'
+    output += f'Weight decay {args.weight_decay}  \n'
+    output += f'Batch size {args.batch_size}  \n'
+    output += f'Per params alpha {args.per_params_alpha}  \n'
+    output += f'Per layer alpha {args.per_layer_alpha}  \n'
+    output += f'Concrete lower {args.concrete_lower}  \n'
+    output += f'Concrete upper {args.concrete_upper}  \n'
     output += f'Start update steps {args.update_steps_start}'
     writer.add_text('Parameters', output, args.update_steps_start)
 

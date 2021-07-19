@@ -13,9 +13,10 @@ def load_dataset(path, tokenizer: PreTrainedTokenizer, tags_vocab,
                  cutoff: int = 200) -> NerDataset:
     raw_items = BioNerFileFormat.deserialize(path.read_text().splitlines())
     encoded_items: List[NerDatasetItem] = []
+    cache = {}
     for i, item in enumerate(tqdm(raw_items)):
         encoded_item = encode_raw_ner_item(item, tokenizer=tokenizer, cutoff=cutoff,
-                                           tags_vocab=tags_vocab)
+                                           tags_vocab=tags_vocab, cache=cache)
         encoded_items.append(encoded_item)
     return NerDataset(encoded_items)
 

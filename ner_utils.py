@@ -93,9 +93,9 @@ def align_word_ids_with_tag_ids(encoded_words, encoded_tags, unk_tag_id: int,
 
 def encode_raw_ner_item(
         raw_ner_item, tokenizer: PreTrainedTokenizer, cutoff: int,
-        tags_vocab, alignment='SAME'):
+        tags_vocab, cache=None, alignment='SAME'):
     pad_tag_id, unk_tag_id = tags_vocab[PAD_TAG], tags_vocab[UNK_TAG]
-    encoded_words = encode_words(raw_ner_item.words, tokenizer)
+    encoded_words = encode_words(raw_ner_item.words, tokenizer, cache=cache)
     encoded_tags = encode_tags(raw_ner_item.tags, tags_vocab)
 
     text_ids, aligned_tags_ids = \

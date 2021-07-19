@@ -184,7 +184,7 @@ class DiffPruning:
         if f"{self.model_name}.embeddings" in layer_name:
             return ind
         elif f"{self.model_name}.encoder.layer" in layer_name:
-            ind = int(layer_name.split(".")[3 if "module" not in layer_name else 4])
+            ind = int(layer_name.split(".")[3 if "module" not in layer_name else 4]) + 1
         else:
             ind = self.total_layers - 1
         return ind
@@ -273,6 +273,7 @@ class DiffPruning:
     def __calculate_grads(self) -> NoReturn:
         device = self.device
         for name, param in self.model.named_parameters():
+            device = self.bert_params[name]['w'].device
             if "classifier" in name or "qa" in name:
                 # copying updated gradient to the respective w vector
                 self.bert_params[name]['w'].grad += param.grad.to(device)
@@ -441,14 +442,20 @@ class DiffPruning:
         if self.pl_alpha:
             self.per_layer_z_grad = [0] * self.total_layers
 
-    def evaluate_and_write(self, writer, eval_func, val_dataloader, label_map, tokenizer, update_steps):
-        _, _, = self._calculate_params(no_grads=True)
-        val_loss, metrics = eval_func(self, val_dataloader, label_map, tokenizer)
+    def evaluate_and_write(self, writer, eval_func, val_dataloader, update_steps, **kwargs):
+        l0_penalty, nonzero_params = self._calculate_params(no_grads=True)
+        val_loss, metrics = eval_func(self, val_dataloader, **kwargs)
         if writer is not None:
             writer.add_scalar('Losses/val', val_loss, update_steps)
-            writer.add_scalar('Metrics/f1_dev', metrics['f1'], update_steps)
-            writer.add_scalar('Metrics/precision_dev', metrics['precision'], update_steps)
-            writer.add_scalar('Metrics/recall_dev', metrics['recall'], update_steps)
+            for name, metric in metrics.items():
+                writer.add_scalar(f'Metrics/{name}_dev', metric, update_steps)
+            if not self.no_diff and self.sparsity_penalty > 0.:
+                writer.add_scalar('Diff/l0_penalty',
+                                  l0_penalty * self.sparsity_penalty,
+                                  update_steps)
+                writer.add_scalar('Diff/nonzero_count',
+                                  nonzero_params,
+                                  update_steps)
         return val_loss
 
     def load(self, path: str = None, no_diff_load=False, train=False):
@@ -520,20 +527,20 @@ class DiffPruning:
         writer = None
         if args.write and local_rank in [-1, 0]:
             writer = setup_logging(self.task_name + '_' + self.model_name + ('_no_diff' if self.no_diff else '_diff'))
-        # logging params to summary writer
-        write_params(writer, args)
+            # logging params to summary writer
+            write_params(writer, args)
 
         self.__setup_distributed(local_rank)
         epochs, t_total = self.__prepare_scheduler(args, train_dataloader)
         self.model.zero_grad()
         update_steps = args.update_steps_start
         best_val_loss = np.inf
-        tags_vocab = {value: key for key, value in label_map.items()}
 
         if local_rank in [-1, 0]:
             log_start_training(self.logger, args, train_dataloader, t_total)
             if val_dataloader is not None:
-                self.evaluate_and_write(writer, eval_func, val_dataloader, label_map, tokenizer, update_steps)
+                self.evaluate_and_write(writer, eval_func, val_dataloader, update_steps,
+                                        label_map=label_map, tokenizer=tokenizer)
 
         train_iterator = trange(0, epochs, desc="Epoch")
         for epoch in train_iterator:
@@ -548,12 +555,18 @@ class DiffPruning:
 
                 # forward pass
                 self.model.train()
-                batch = get_ner_model_inputs(batch, tokenizer, tags_vocab)
+                if self.task_name == 'ner':
+                    tags_vocab = {value: key for key, value in label_map.items()}
+                    batch = get_ner_model_inputs(batch, tokenizer, tags_vocab)
                 output = self.model(**{key: value.to(self.model.device) for key, value in batch.items()})
-                loss = ner_loss(output.logits.cpu(), batch['labels'], batch['attention_mask'])
+
+                if self.task_name == 'ner':
+                    loss = ner_loss(output.logits.cpu(), batch['labels'], batch['attention_mask'])
+                else:
+                    loss = output.loss
+
                 train_loss = loss.detach().item()
                 if not self.no_diff:
-                    l0_penalty = l0_penalty_sum.detach().item()
                     self.backward(loss, l0_penalty_sum)
                 else:
                     self.backward(loss)
@@ -570,27 +583,20 @@ class DiffPruning:
                     update_steps += 1
 
                     if local_rank in [-1, 0] and writer is not None:
-                            writer.add_scalar('Losses/train',
-                                              train_loss,
+                        writer.add_scalar('Losses/train',
+                                          train_loss,
+                                          update_steps)
+                        writer.add_scalar('LR/w',
+                                          self.__get_optimizer_lr(self.optimizer_params),
+                                          update_steps)
+                        if not self.no_diff:
+                            writer.add_scalar('LR/alpha',
+                                              self.__get_optimizer_lr(self.optimizer_alpha),
                                               update_steps)
-                            writer.add_scalar('LR/w',
-                                              self.__get_optimizer_lr(self.optimizer_params),
-                                              update_steps)
-                            if not self.no_diff:
-                                writer.add_scalar('LR/alpha',
-                                                  self.__get_optimizer_lr(self.optimizer_alpha),
-                                                  update_steps)
-                            if not self.no_diff and self.sparsity_penalty > 0.:
-                                writer.add_scalar('Diff/l0_penalty',
-                                                  l0_penalty,
-                                                  update_steps)
-                                writer.add_scalar('Diff/nonzero_count',
-                                                  nonzero_params,
-                                                  update_steps)
 
                     if val_dataloader is not None and local_rank in [-1, 0] and update_steps % args.eval_steps == 0:
                         val_loss = self.evaluate_and_write(writer, eval_func, val_dataloader,
-                                                           label_map, tokenizer, update_steps)
+                                                           update_steps, label_map=label_map, tokenizer=tokenizer)
                         if val_loss < best_val_loss:
                             if not self.no_diff:
                                 self.save(path_bert_params=f"bert_params_{saving_name}_best.pt")
@@ -603,4 +609,3 @@ class DiffPruning:
                             self.save(path_bert_params=f"bert_params_{saving_name}_last.pt")
                         else:
                             self.save(path_params=f"no_diff_{saving_name}_last.pt")
-
