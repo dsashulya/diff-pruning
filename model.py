@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime
 from typing import Tuple, Union, NoReturn
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -268,7 +269,7 @@ class DiffPruning:
                                  (z * z2).data * self.bert_params[name]['w'].data)
                 nonzero_params += ((z * z2) > 0).float().detach().sum().item()
                 prev_layer_ind = layer_ind
-        return l0_penalty_sum, nonzero_params
+        return l0_penalty_sum, int(nonzero_params)
 
     def __calculate_grads(self) -> NoReturn:
         device = self.device
@@ -457,6 +458,25 @@ class DiffPruning:
                                   nonzero_params,
                                   update_steps)
         return val_loss
+
+    def get_sparsity(self, threshold: float):
+        """ Returns current sparsity of the diff vector """
+        nonzero = 0
+        total = 0
+        for name, param in self.model.named_parameters():
+            diff = param - self.bert_params[name]['pretrained']
+            nonzero += torch.sum(torch.abs(diff) > threshold).item()
+            total += diff.numel()
+        return nonzero / total
+
+    def apply_magnitude_pruning(self, threshold):
+        new_state_dict = deepcopy(self.model.state_dict())
+        for name, param in self.model.named_parameters():
+            diff = param - self.bert_params[name]['pretrained']
+            diff[torch.abs(diff) < threshold] = 0.
+            assert diff.size() == self.bert_params[name]['pretrained'].size(), "Diff and param size mismatch"
+            new_state_dict[name] = self.bert_params[name]['pretrained'] + diff
+        self.model.load_state_dict(new_state_dict)
 
     def load(self, path: str = None, no_diff_load=False, train=False):
         # when loading diff model in diff mode

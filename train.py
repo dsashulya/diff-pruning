@@ -85,7 +85,7 @@ def setup_distributed(rank, world_size):
 def setup_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=10, type=int, required=False)
-    parser.add_argument('--do_train', default=True, type=lambda x: bool(int(x)), required=True)
+    parser.add_argument('--do_train', default=False, type=lambda x: bool(int(x)), required=False)
     parser.add_argument('--do_eval', default=False, type=lambda x: bool(int(x)), required=False)
     parser.add_argument('--local_rank', default=-1, type=int, required=False)
     parser.add_argument('--world_size', default=1, type=int, required=False)
@@ -97,6 +97,12 @@ def setup_argparser() -> argparse.ArgumentParser:
                         help="checkpoint to load the model from")
     parser.add_argument('--load_diff_checkpoint', default=False, type=lambda x: bool(int(x)), required=False,
                         help="whether the checkpoint that is being loaded was trained in diff mode")
+    parser.add_argument('--magnitude_pruning', default=False, type=lambda x: bool(int(x)), required=False,
+                        help="whether to apply magnitude pruning at the end of training")
+    parser.add_argument('--threshold', default=-1, type=float, required=False,
+                        help='magnitude pruning threshold')
+    parser.add_argument('--target_sparsity', default=0.005, type=float, required=False,
+                        help='target sparsity for magnitude pruning')
 
     # data params
     parser.add_argument('--path_to_train', default=None, type=str, required=False)
@@ -193,28 +199,8 @@ def eval_squad(args):
 
 @torch.no_grad()
 def eval_ner(args):
-    label2id: Dict[str, int] = build_dict(UTIL_TAGS + ['GENE'], ['B-', 'I-', 'E-', 'S-'])
-    label_map = {value: key for key, value in label2id.items()}
-    num_labels = len(label_map)
-
-    model_class, config_class, tokenizer_class = MODEL_CLASSES[args.task_name][args.model_name].values()
-    config = config_class.from_pretrained(
-        args.model_name_or_path,
-        num_labels=num_labels,
-        id2label=label_map,
-        label2id=label2id,
-    )
-
-    tokenizer = tokenizer_class.from_pretrained(
-        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
-        use_fast=args.use_fast
-    )
-    model = model_class.from_pretrained(
-        args.model_name_or_path,
-        from_tf=bool(".ckpt" in args.model_name_or_path),
-        config=config
-    ).to("cuda" if torch.cuda.is_available() else "cpu")
-    _, dataloader = get_bc2gm_train_data(args, tokenizer, return_train=False, return_val=True, tags_vocab=label2id)
+    model, tokenizer = load_model(args.local_rank, args)
+    _, dataloader = get_bc2gm_train_data(args, tokenizer, return_train=False, return_val=True, tags_vocab=args.label2id)
     diff_model = init_model(args, model)
     if args.model_checkpoint:
         if args.load_diff_checkpoint:
@@ -223,22 +209,16 @@ def eval_ner(args):
             diff_model.load(args.model_checkpoint, no_diff_load=True)
     set_seed(args)
 
-    # torch.save(diff_model.model.state_dict(), "bert_state_dict.pt")
-    nonzero, _ = diff_model._calculate_params(no_grads=True)
-    metrics = evaluate_ner_metrics(diff_model, dataloader, label_map, tokenizer)
+    _, nonzero = diff_model._calculate_params(no_grads=True)
+    _, metrics = evaluate_ner_metrics(diff_model, dataloader, args.label_map, tokenizer)
 
-    print(metrics)
-    print(nonzero.item())
-    print(nonzero.item() / 110_000_000 * 100)
+    for metric, value in metrics.items():
+        print(f"{metric} = {value:.4f}")
+    print(f"nonzero count = {nonzero}")
+    print(f"nonzero frac = {diff_model.get_sparsity(threshold=0.):.4f}")
 
 
-def train(local_rank, args):
-    filename = f"log_{args.task_name}_" + ("diff_.txt" if not args.no_diff else "no_diff.txt")
-    logging.basicConfig(filename=filename, filemode='a', level=args.logging_level)
-
-    if args.local_rank != -1:
-        setup_distributed(local_rank, args.world_size)
-
+def load_model(local_rank, args):
     # Make sure only the first process in distributed training will download model & vocab
     if local_rank not in [-1, 0]:
         torch.distributed.barrier()
@@ -249,6 +229,8 @@ def train(local_rank, args):
         label2id: Dict[str, int] = build_dict(UTIL_TAGS + ['GENE'], ['B-', 'I-', 'E-', 'S-'])
         label_map = {value: key for key, value in label2id.items()}
         num_labels = len(label_map)
+        args.label_map = label_map
+        args.label2id = label2id
 
         config = config_class.from_pretrained(
             args.model_name_or_path,
@@ -270,12 +252,60 @@ def train(local_rank, args):
         config=config
     ).to("cuda" if torch.cuda.is_available() else "cpu")
 
+    return model, tokenizer
+
+
+def magnitude_pruning(args):
+    model, tokenizer = load_model(args.local_rank, args)
+    diff_model = init_model(args, model)
+    if args.model_checkpoint:
+        if args.load_diff_checkpoint:
+            diff_model.load(args.model_checkpoint, train=False)
+        else:
+            diff_model.load(args.model_checkpoint, no_diff_load=True)
+    if args.threshold < 0: # DEFAULT -1 USED
+        assert 0 <= args.target_sparsity <= 1, "Target sparsity must be between 0 and 1"
+        l, r = 0., 1.
+        # SEARCHING FOR A THRESHOLD THAT'LL PROVIDE THE TARGET SPARSITY BY ZEROING OUT EVERYTHING BELOW IT
+        # THRESHOLD CAN'T BE GREATER THAN 1
+        while l + 1e-6 < r:
+            mid = (l + r) / 2.0
+            if diff_model.get_sparsity(mid) <= args.target_sparsity:
+                r = mid
+            else:
+                l = mid
+        threshold = r
+    else:
+        threshold = args.threshold
+
+    diff_model.apply_magnitude_pruning(threshold)
+
+    save_name = args.model_checkpoint.replace('.pt', '') + '_mag_prune.pt'
+    diff_model.save(path_bert_params=save_name)
+
+    _, dataloader = get_bc2gm_train_data(args, tokenizer, return_train=False, return_val=True, tags_vocab=args.label2id)
+    set_seed(args)
+    _, metrics = evaluate_ner_metrics(diff_model, dataloader, args.label_map, tokenizer)
+    for metric, value in metrics.items():
+        print(f"{metric} = {value:.4f}")
+    print(f"% nonzero = {diff_model.get_sparsity(threshold=0.)}")
+
+
+def train(local_rank, args):
+    filename = f"log_{args.task_name}_" + ("diff_.txt" if not args.no_diff else "no_diff.txt")
+    logging.basicConfig(filename=filename, filemode='a', level=args.logging_level)
+
+    if args.local_rank != -1:
+        setup_distributed(local_rank, args.world_size)
+
+    model, tokenizer = load_model(local_rank, args)
+
     if args.task_name == 'squad':
         train_dataloader, val_dataloader = get_train_data(args=args,
                                                           tokenizer=tokenizer,
                                                           return_val=True)
     elif args.task_name == 'ner':
-        train_dataloader, val_dataloader = get_bc2gm_train_data(args, tokenizer, tags_vocab=label2id, return_val=True)
+        train_dataloader, val_dataloader = get_bc2gm_train_data(args, tokenizer, tags_vocab=args.label2id, return_val=True)
 
     else:
         train_dataloader, val_dataloader = None, None
@@ -299,8 +329,9 @@ def train(local_rank, args):
                      train_dataloader=train_dataloader,
                      val_dataloader=val_dataloader,
                      eval_func=eval_func,
-                     label_map=label_map,
+                     label_map=args.label_map,
                      tokenizer=tokenizer)
+
 
 
 if __name__ == "__main__":
@@ -318,3 +349,5 @@ if __name__ == "__main__":
             eval_squad(args)
         else:
             eval_ner(args)
+    elif args.magnitude_pruning:
+        magnitude_pruning(args)
