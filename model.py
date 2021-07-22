@@ -150,9 +150,14 @@ class DiffPruning:
         # logging
         self.logger = logging.getLogger(__name__)
 
+        self._fixmask_finetune = False
+
     @property
     def device(self):
         return self.model.device
+
+    def fixmask_finetune(self):
+        self._fixmask_finetune = True
 
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
@@ -238,6 +243,10 @@ class DiffPruning:
                 layer_ind = self._get_layer_ind(name)
                 # passing main alpha through concrete stretched
                 z, z_grad = self.concrete_stretched(self.bert_params[name]['alpha'])
+                if self._fixmask_finetune or 'z' in self.bert_params[name]:
+                    assert 'z' in self.bert_params[name], "Perform magnitude pruning first"
+                    z = self.bert_params[name]['z']
+                    z_grad = torch.zeros_like(z)
                 if l0_penalty_sum is None:
                     l0_penalty_sum = torch.sigmoid(self.bert_params[name]['alpha'] - self.log_ratio).sum()
                 else:
@@ -272,7 +281,6 @@ class DiffPruning:
         return l0_penalty_sum, int(nonzero_params)
 
     def __calculate_grads(self) -> NoReturn:
-        device = self.device
         for name, param in self.model.named_parameters():
             device = self.bert_params[name]['w'].device
             if "classifier" in name or "qa" in name:
@@ -475,6 +483,8 @@ class DiffPruning:
             diff = param - self.bert_params[name]['pretrained']
             diff[torch.abs(diff) < threshold] = 0.
             assert diff.size() == self.bert_params[name]['pretrained'].size(), "Diff and param size mismatch"
+            self.bert_params[name]['w'].data.copy_(diff)
+            self.bert_params[name]['z'] = (diff != 0.).float()
             new_state_dict[name] = self.bert_params[name]['pretrained'] + diff
         self.model.load_state_dict(new_state_dict)
 
@@ -586,7 +596,7 @@ class DiffPruning:
                     loss = output.loss
 
                 train_loss = loss.detach().item()
-                if not self.no_diff:
+                if not self.no_diff and not self._fixmask_finetune:
                     self.backward(loss, l0_penalty_sum)
                 else:
                     self.backward(loss)

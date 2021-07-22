@@ -28,7 +28,6 @@ from tags import UTIL_TAGS
 from eval import evaluate_ner_metrics
 from squad_utils import get_train_data, get_validation_data, postprocess_qa_predictions
 
-
 MODEL_CLASSES = {'qa': {
     "bert": {"model": BertForQuestionAnswering,
              "config": BertConfig,
@@ -103,6 +102,8 @@ def setup_argparser() -> argparse.ArgumentParser:
                         help='magnitude pruning threshold')
     parser.add_argument('--target_sparsity', default=0.005, type=float, required=False,
                         help='target sparsity for magnitude pruning')
+    parser.add_argument('--fixmask_finetune', default=False, type=lambda x: bool(int(x)), required=False,
+                        help='whether to apply fixed mask finetuning (after magnitude pruning)')
 
     # data params
     parser.add_argument('--path_to_train', default=None, type=str, required=False)
@@ -263,7 +264,7 @@ def magnitude_pruning(args):
             diff_model.load(args.model_checkpoint, train=False)
         else:
             diff_model.load(args.model_checkpoint, no_diff_load=True)
-    if args.threshold < 0: # DEFAULT -1 USED
+    if args.threshold < 0:  # DEFAULT -1 USED
         assert 0 <= args.target_sparsity <= 1, "Target sparsity must be between 0 and 1"
         l, r = 0., 1.
         # SEARCHING FOR A THRESHOLD THAT'LL PROVIDE THE TARGET SPARSITY BY ZEROING OUT EVERYTHING BELOW IT
@@ -280,7 +281,7 @@ def magnitude_pruning(args):
 
     diff_model.apply_magnitude_pruning(threshold)
 
-    save_name = args.model_checkpoint.replace('.pt', '') + '_mag_prune.pt'
+    save_name = args.model_checkpoint.replace('.pt', '') + f'_mag_prune_{args.target_sparsity}.pt'
     diff_model.save(path_bert_params=save_name)
 
     _, dataloader = get_bc2gm_train_data(args, tokenizer, return_train=False, return_val=True, tags_vocab=args.label2id)
@@ -305,7 +306,8 @@ def train(local_rank, args):
                                                           tokenizer=tokenizer,
                                                           return_val=True)
     elif args.task_name == 'ner':
-        train_dataloader, val_dataloader = get_bc2gm_train_data(args, tokenizer, tags_vocab=args.label2id, return_val=True)
+        train_dataloader, val_dataloader = get_bc2gm_train_data(args, tokenizer, tags_vocab=args.label2id,
+                                                                return_val=True)
 
     else:
         train_dataloader, val_dataloader = None, None
@@ -323,6 +325,9 @@ def train(local_rank, args):
         else:
             diff_model.load(args.model_checkpoint, no_diff_load=True)
 
+    if args.fixmask_finetune:
+        diff_model.fixmask_finetune()
+
     set_seed(args)
     diff_model.train(local_rank=local_rank,
                      args=args,
@@ -331,7 +336,6 @@ def train(local_rank, args):
                      eval_func=eval_func,
                      label_map=args.label_map,
                      tokenizer=tokenizer)
-
 
 
 if __name__ == "__main__":

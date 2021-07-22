@@ -28,7 +28,7 @@ def update_confusion_matrix(conf_matrix: Tensor, actual: Tensor, predicted: Tens
 
 def f1_score_micro_precision_recall(conf_matrix: Tensor, *, start: int = 0, end: Optional[int] = None) \
         -> Tuple[Tensor, Tensor, Tensor]:
-    score = 0.
+    score, precision, recall = 0., 0., 0.
     pr, p, r = 0., 0., 0.
     for tag in range(start, conf_matrix.size(0) if end is None else end):
         pr += conf_matrix[tag, tag].item()
@@ -38,7 +38,17 @@ def f1_score_micro_precision_recall(conf_matrix: Tensor, *, start: int = 0, end:
         score = 2 * pr / (p + r)
     except ZeroDivisionError:
         pass
-    return torch.tensor(score), torch.tensor(pr / r), torch.tensor(pr / p)
+
+    try:
+        precision = pr / r
+    except ZeroDivisionError:
+        pass
+
+    try:
+        recall = pr / p
+    except ZeroDivisionError:
+        pass
+    return torch.tensor(score), torch.tensor(precision), torch.tensor(recall)
 
 
 @torch.no_grad()
