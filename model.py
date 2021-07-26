@@ -465,7 +465,7 @@ class DiffPruning:
                 writer.add_scalar('Diff/nonzero_count',
                                   nonzero_params,
                                   update_steps)
-        return val_loss
+        return val_loss, metrics
 
     def get_sparsity(self, threshold: float):
         """ Returns current sparsity of the diff vector """
@@ -564,12 +564,12 @@ class DiffPruning:
         epochs, t_total = self.__prepare_scheduler(args, train_dataloader)
         self.model.zero_grad()
         update_steps = args.update_steps_start
-        best_val_loss = np.inf
+        best_f1 = -np.inf
 
         if local_rank in [-1, 0]:
             log_start_training(self.logger, args, train_dataloader, t_total)
             if val_dataloader is not None:
-                self.evaluate_and_write(writer, eval_func, val_dataloader, update_steps,
+                _, _, = self.evaluate_and_write(writer, eval_func, val_dataloader, update_steps,
                                         label_map=label_map, tokenizer=tokenizer)
 
         train_iterator = trange(0, epochs, desc="Epoch")
@@ -612,30 +612,31 @@ class DiffPruning:
                     self.__step()
                     update_steps += 1
 
-                    if local_rank in [-1, 0] and writer is not None:
-                        writer.add_scalar('Losses/train',
-                                          train_loss,
-                                          update_steps)
-                        writer.add_scalar('LR/w',
-                                          self.__get_optimizer_lr(self.optimizer_params),
-                                          update_steps)
-                        if not self.no_diff:
-                            writer.add_scalar('LR/alpha',
-                                              self.__get_optimizer_lr(self.optimizer_alpha),
+                    if local_rank in [-1, 0]:
+                        if writer is not None:
+                            writer.add_scalar('Losses/train',
+                                              train_loss,
                                               update_steps)
-
-                    if val_dataloader is not None and local_rank in [-1, 0] and update_steps % args.eval_steps == 0:
-                        val_loss = self.evaluate_and_write(writer, eval_func, val_dataloader,
-                                                           update_steps, label_map=label_map, tokenizer=tokenizer)
-                        if val_loss < best_val_loss:
+                            writer.add_scalar('LR/w',
+                                              self.__get_optimizer_lr(self.optimizer_params),
+                                              update_steps)
                             if not self.no_diff:
-                                self.save(path_bert_params=f"bert_params_{saving_name}_best.pt")
-                            else:
-                                self.save(path_params=f"no_diff_{saving_name}_best.pt")
-                            best_val_loss = val_loss
+                                writer.add_scalar('LR/alpha',
+                                                  self.__get_optimizer_lr(self.optimizer_alpha),
+                                                  update_steps)
 
-                    if local_rank in [-1, 0] and update_steps % args.save_steps == 0:
-                        if not self.no_diff:
-                            self.save(path_bert_params=f"bert_params_{saving_name}_last.pt")
-                        else:
-                            self.save(path_params=f"no_diff_{saving_name}_last.pt")
+                        if val_dataloader is not None and update_steps % args.eval_steps == 0:
+                            val_loss, metrics = self.evaluate_and_write(writer, eval_func, val_dataloader,
+                                                               update_steps, label_map=label_map, tokenizer=tokenizer)
+                            if metrics['f1'] > best_f1:
+                                if not self.no_diff:
+                                    self.save(path_bert_params=f"bert_params_{saving_name}_best.pt")
+                                else:
+                                    self.save(path_params=f"no_diff_{saving_name}_best.pt")
+                                best_f1 = metrics['f1']
+
+                        if update_steps % args.save_steps == 0:
+                            if not self.no_diff:
+                                self.save(path_bert_params=f"bert_params_{saving_name}_last.pt")
+                            else:
+                                self.save(path_params=f"no_diff_{saving_name}_last.pt")
