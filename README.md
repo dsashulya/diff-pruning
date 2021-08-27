@@ -7,9 +7,10 @@ Sources:
 
 **Task 1**: finetuning [BioBERT](https://github.com/dmis-lab/biobert-pytorch) with diff-vector on [BC2GM](https://github.com/cambridgeltl/MTL-Bioinformatics-2016/tree/master/data/BC2GM-IOBES)
 
-  - Precision:   87.69
-  - Recall:   85.31
-  - F1: 86.31
+  - Precision:   85.56
+  - Recall:   87.02
+  - F1: 86.28
+
  
 
 Parameter  | Value
@@ -25,22 +26,29 @@ batch size   | 32
 **Task 2**: diff pruning [BioBERT](https://github.com/dmis-lab/biobert-pytorch) with diff-vector on [BC2GM](https://github.com/cambridgeltl/MTL-Bioinformatics-2016/tree/master/data/BC2GM-IOBES)
 Parameter  | Value
 ------------ | -------------
-epochs       | 160
-w learning rate| 1e-4
-alpha learning rate| 1e-4
+epochs       | 80
+w learning rate| 1e-5
+alpha learning rate| 1e-1
+sparsity penalty | 1.25e-7
 weight decay | 1e-2
 batch size   | 32
 
-  - Nonzero parameters: 20.5%
-  - Precision:   86.49
-  - Recall:   84.02
-  - F1: 85.01
- 
-F1 score            |  Nonzero parameter count
-:-------------------------:|:-------------------------:
-![](img/f1.png)  |  ![](img/nonzero.png)
+  - Nonzero parameters: 1.1%
+  - Precision:   84.73
+  - Recall:   83.32
+  - F1: 86.19
 
+Magnitude Pruning and Fixmask Finetuning:
+Parameter  | Value
+------------ | -------------
+epochs       | 80
+w learning rate| 1e-5
+alpha learning rate| -
+sparsity penalty | -
+weight decay | 1e-2
+batch size   | 32
 
-Train loss shows that training beyond 160 epochs leads to the model missing optimum and the metrics above, subsequently, decreasing.
-
-![](img/train.png)
+  - Nonzero parameters:0.5%
+  - Precision:   86.43
+  - Recall:   84.33
+  - F1: 85.37
