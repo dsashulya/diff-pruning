@@ -24,6 +24,7 @@ batch size   | 32
 
 
 **Task 2**: diff pruning [BioBERT](https://github.com/dmis-lab/biobert-pytorch) with diff-vector on [BC2GM](https://github.com/cambridgeltl/MTL-Bioinformatics-2016/tree/master/data/BC2GM-IOBES)
+
 Parameter  | Value
 ------------ | -------------
 epochs       | 80
@@ -39,6 +40,7 @@ batch size   | 32
   - F1: 86.19
 
 Magnitude Pruning and Fixmask Finetuning:
+
 Parameter  | Value
 ------------ | -------------
 epochs       | 80
